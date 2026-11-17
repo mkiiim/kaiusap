@@ -1,0 +1,3 @@
+{"name": "kaiusap", "interface": {"displayName": "kAIusap"},
+ "plugins": [{"name": "kaiusap", "source": "./plugins/codex",
+              "policy": {"installation": "AVAILABLE"}}]}

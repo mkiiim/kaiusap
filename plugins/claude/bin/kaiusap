@@ -1,0 +1,13 @@
+#!/bin/sh
+# kaiusap-plugin-launcher: runs the installed kaiusap with the same arguments.
+if [ -n "$KAIUSAP_BIN" ] && [ -x "$KAIUSAP_BIN" ]; then exec "$KAIUSAP_BIN" "$@"; fi
+if [ -x "$HOME/.local/bin/kaiusap" ]; then exec "$HOME/.local/bin/kaiusap" "$@"; fi
+# kaiusap on the PATH, skipping any launcher: a plugin's bin/ may be on the PATH, this one's included.
+set -f; IFS=:
+for dir in $PATH; do
+  found="${dir:-.}/kaiusap"
+  if [ -f "$found" ] && [ -x "$found" ] && ! grep -q kaiusap-plugin-launcher "$found" 2>/dev/null; then exec "$found" "$@"; fi
+done
+text="kaiusap isn't installed (looked in ~/.local/bin/kaiusap and on the PATH). Run ./install.sh."
+if [ "$1" = hook ]; then printf '{"systemMessage": "%s"}\n' "$text"; exit 0; fi
+printf '%s\n' "$text" >&2; exit 1

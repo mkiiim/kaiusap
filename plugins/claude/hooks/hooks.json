@@ -1,0 +1,11 @@
+{"hooks": {
+  "SessionStart":     [{"hooks": [{"type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/kaiusap hook claude SessionStart", "timeout": 5}]}],
+  "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/kaiusap hook claude UserPromptSubmit", "timeout": 2}]}],
+  "PreToolUse":       [{"matcher": "mcp__plugin_kaiusap_kaiusap__.*",
+                        "hooks": [{"type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/kaiusap hook claude PreToolUse", "timeout": 2}]},
+                       {"matcher": "Bash",
+                        "hooks": [{"type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/kaiusap hook claude PreToolUse", "timeout": 2}]}],
+  "PermissionRequest": [{"hooks": [{"type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/kaiusap hook claude PermissionRequest", "timeout": 2}]}],
+  "Stop":              [{"hooks": [{"type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/kaiusap hook claude Stop", "timeout": 2}]}],
+  "StopFailure":       [{"hooks": [{"type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/kaiusap hook claude StopFailure", "timeout": 2}]}],
+  "Elicitation":       [{"hooks": [{"type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/kaiusap hook claude Elicitation", "timeout": 2}]}]}}

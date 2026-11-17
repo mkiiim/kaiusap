@@ -1,0 +1,4 @@
+#!python
+# Source-distribution placeholder; BuildScripts replaces this with the native entry point.
+from kaiusap.entry import main
+raise SystemExit(main())

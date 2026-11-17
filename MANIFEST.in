@@ -1,0 +1,3 @@
+include native/hook.rs
+include src/kaiusap/adapters/*.rs
+include scripts/kaiusap

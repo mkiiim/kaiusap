@@ -1,0 +1,3 @@
+{"name": "kaiusap", "version": "0.2.0",
+ "description": "Message other Claude Code, Codex, and OpenCode sessions on this machine by handle.",
+ "mcpServers": "./.mcp.json", "hooks": "./hooks/hooks.json"}

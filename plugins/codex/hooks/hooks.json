@@ -1,0 +1,5 @@
+{"description": "kaiusap hooks",
+ "hooks": {
+  "SessionStart":     [{"hooks": [{"type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/kaiusap hook codex SessionStart", "timeout": 5}]}],
+  "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/kaiusap hook codex UserPromptSubmit", "timeout": 2}]}],
+  "SubagentStart":    [{"hooks": [{"type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/kaiusap hook codex SubagentStart", "timeout": 2}]}]}}

@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kaiusap"
+version = "0.2.0"
+description = "Message assistant sessions on this machine by handle"
+requires-python = ">=3.12"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+dependencies = ["mcp==2.3.0", "websockets>=17"]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+
+[tool.setuptools.exclude-package-data]
+# The native parts are compiled into the hook entry point (setup.py), not installed as data.
+"kaiusap.adapters" = ["*.rs"]
