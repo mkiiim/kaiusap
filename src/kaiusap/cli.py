@@ -82,9 +82,10 @@ def parse(argv, stdin):
     if len(positionals) > expected:
         raise Error("Unexpected positional argument. Run kaiusap help.", 64)
     if expected:
-        if not positionals:
+        if positionals:
+            args[POSITIONAL[verb]] = positionals[0]
+        elif verb != "iam":  # `iam` with no handle takes a generated name
             raise Error(f"{verb} requires {POSITIONAL[verb]}.")
-        args[POSITIONAL[verb]] = positionals[0]
     if verb in {"send", "reply"}:
         args["fields"] = {k: args.pop(k) for k in list(args) if k in FIELDS}
     return verb, args
@@ -130,7 +131,10 @@ def render(verb, result):
     if verb == "version":
         return "kaiusap " + label(r)
     if verb == "iam":
-        text = f"{r['handle']} {'already' if r['already_held'] else 'now'} points to this session."
+        if r.get("generated"):
+            text = f"kaiusap picked `{r['handle']}`; it now points to this session."
+        else:
+            text = f"{r['handle']} {'already' if r['already_held'] else 'now'} points to this session."
         if r["moved_from"]:
             old = r["moved_from"]
             text += f" Moved from the {display_name(old['provider'])} session in {old['cwd'] or '(unknown directory)'}, named {old['name'] or '(unknown)'}."

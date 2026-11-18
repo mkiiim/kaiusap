@@ -28,7 +28,7 @@ RULES = [
     "Never put secrets in a message.",
     "There is no mail for the user. When a message needs the user, say so here, in this session, by sender and subject.",
     "If you are a subagent or an in-process teammate, only look: don't send, reply, change handles, mark mail moot or unpause. Report to the agent that started you; it sends.",
-    "If you have no handle, kaiusap may suggest a name once; a handle kaiusap said you may be comes first. Ask the user whether to take it, or what to call you instead, and take it with iam once they confirm. You need a handle to send.",
+    "If you have no handle, kaiusap may suggest a name once; a handle kaiusap said you may be comes first. Ask the user whether to take it, or what to call you instead, and take it with iam once they confirm. You need a handle to send. If the user asks you to pick a name, run iam with no handle.",
     "Don't read or change files under ~/.kaiusap unless the user asks you to; use kaiusap's commands.",
 ]
 # What a session with no handle is told, once, with the name kaiusap generated for it.
@@ -45,7 +45,7 @@ def rule_lines(numbers=None):
 
 VERBS = {
     "whoami": "Show your handle, reachability and unread count.", "who": "List active handles.",
-    "iam": "Take a handle on the user's word; refused while a running session holds it.", "release": "Release your handle on the user's word.",
+    "iam": "Take a handle on the user's word; refused while a running session holds it. With no handle, take a generated one.", "release": "Release your handle on the user's word.",
     "send": "Send a new message using --to, --subject, --reply-needed yes|no and body fields.",
     "reply": "Answer a message id using --body and --reply-needed yes|no.",
     "inbox": "List your mail; --all includes resolved mail, --sent lists sent mail.",
@@ -156,11 +156,22 @@ class Core:
         return dict(build.running())
 
     def iam(self, handle=None):
-        if not isinstance(handle, str) or not re.fullmatch(r"[a-z][a-z0-9-]{1,31}", handle):
+        generated = handle is None
+        if not generated and (not isinstance(handle, str) or not re.fullmatch(r"[a-z][a-z0-9-]{1,31}", handle)):
             raise Error(f"{handle or ''} isn't a valid handle. Use 2–32 lowercase letters, digits and hyphens, starting with a letter.")
         identity = self.identity
         with self.store.locked():
             bindings = handles(self.store)
+            if generated:
+                # Picked under the same lock that binds it, so the name is still free when it is taken.
+                holding = self.caller_handle(bindings, False)
+                if holding:
+                    raise Error(f"This session is {holding}. iam with no handle only names a session that has none.")
+                from . import names
+                try:
+                    handle = names.free(self.store)
+                except LookupError:
+                    raise Error("kaiusap couldn't find a free generated name. Ask the user what to call this session.") from None
             previous = bindings.get(handle)
             current = self.caller_handle(bindings, False)
             same = current == handle
@@ -214,7 +225,7 @@ class Core:
                 "released": current if not same else None, "unread": len(unread),
                 "unread_from": sorted({m["from"]["handle"] for m in unread}),
                 "process_changed": bool(process_changed), "warnings": warnings, "already_held": same,
-                "continued": bool(offer), "notice": notice}
+                "continued": bool(offer), "notice": notice, "generated": generated}
 
     def holder_live(self, binding):
         """Whether the persona holding a binding is live: the adapter's `live`. A check that fails, or
