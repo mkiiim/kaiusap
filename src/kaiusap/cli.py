@@ -6,7 +6,7 @@ import sys
 
 from .adapters import Identity, Providers, display_name
 from .build import label
-from .core import PLAIN_SHELL_STOP, Core, VERBS, rule_lines
+from .core import PLAIN_SHELL_STOP, SUGGESTION, Core, VERBS, rule_lines
 from .errors import Error, store_error
 from .model import FIELDS
 from .store import Store, instant
@@ -269,14 +269,22 @@ def main(argv=None, *, store=None, provider=None, identity=None, stdin=None, std
                 print(text, file=stdout)
             for warning in result.get("warnings") or []:
                 print("Warning: " + warning, file=stdout)
+            if result.get("suggested_handle"):
+                print(SUGGESTION.format(result["suggested_handle"]), file=stdout)
         return 0
     except (OSError, ValueError) as exc:
         error = store_error(exc)
     except Error as exc:
         error = exc
     text = "kaiusap: " + str(error).replace("\n", " ").replace("\r", " ")
+    suggested = getattr(error, "suggested_handle", None)
     if as_json:
-        print(json.dumps({"schema": 1, "error": text, "code": error.code}), file=stdout)
+        refusal = {"schema": 1, "error": text, "code": error.code}
+        if suggested:
+            refusal["suggested_handle"] = suggested
+        print(json.dumps(refusal), file=stdout)
     else:
         print(text, file=stderr)
+        if suggested:
+            print(SUGGESTION.format(suggested), file=stderr)
     return error.code

@@ -11,7 +11,7 @@ import sys
 
 from .adapters import ADAPTERS, Identity, Providers
 from .cli import render
-from .core import Core, rule_lines
+from .core import SUGGESTION, Core, rule_lines
 from .errors import Error, store_error
 from .model import FIELDS, last_directory
 from .store import Store
@@ -194,6 +194,8 @@ def call(provider, tool, given, meta):
         text = render(verb, dict(result)) or ""
         for line in result.get("warnings") or []:
             text += ("\n" if text else "") + "Warning: " + line
+        if result.get("suggested_handle"):
+            text += ("\n" if text else "") + SUGGESTION.format(result["suggested_handle"])
         return text, result, False
     except (OSError, ValueError) as exc:
         error = store_error(exc)
@@ -204,6 +206,10 @@ def call(provider, tool, given, meta):
             providers.finish(catch_up=False)  # a lookup that ended the call early leaves no connection open
     text = "kaiusap: " + str(error).replace("\n", " ").replace("\r", " ")
     structured = {"schema": 1, "error": text, "code": error.code}
+    suggested = getattr(error, "suggested_handle", None)
+    if suggested:
+        text += "\n" + SUGGESTION.format(suggested)
+        structured["suggested_handle"] = suggested
     stale = stale_warning()
     if stale:
         # A refused call carries the notice too: it may be the only call the model makes.

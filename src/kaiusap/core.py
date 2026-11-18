@@ -6,7 +6,7 @@ import time
 
 from .adapters import UnavailableProvider, display_name
 from .errors import Error, blocked
-from .model import PERSONAS, MailView, handles, held, last_directory, load_settings, preview as preview_of, prompted_since, validate
+from .model import PERSONAS, MailView, handles, held, last_directory, load_settings, open_offers, preview as preview_of, prompted_since, validate
 from .notice import paste_line
 from .store import identifier, instant, now
 
@@ -28,9 +28,11 @@ RULES = [
     "Never put secrets in a message.",
     "There is no mail for the user. When a message needs the user, say so here, in this session, by sender and subject.",
     "If you are a subagent or an in-process teammate, only look: don't send, reply, change handles, mark mail moot or unpause. Report to the agent that started you; it sends.",
-    "If you have no handle and need to send, ask the user what to call you, suggesting a name from the directory and provider; take it with iam once they confirm, then send.",
+    "If you have no handle, kaiusap may suggest a name once; a handle kaiusap said you may be comes first. Ask the user whether to take it, or what to call you instead, and take it with iam once they confirm. You need a handle to send.",
     "Don't read or change files under ~/.kaiusap unless the user asks you to; use kaiusap's commands.",
 ]
+# What a session with no handle is told, once, with the name kaiusap generated for it.
+SUGGESTION = "You have no handle. kaiusap suggests `{}`: ask the user whether to take it, or what to call you instead."
 # What a plain shell is told: an assistant that kaiusap can't place stops, rather than reading the store itself.
 PLAIN_SHELL_STOP = ("If you are an assistant, kaiusap can't tell which session you are: stop and tell the user. "
                     "Don't read kaiusap's files unless the user asks you to.")
@@ -98,8 +100,16 @@ class Core:
                     verb == "moot" and self.identity.classification != "plain_shell"):
                 self.require_session()
             method = getattr(self, verb)
-            result = method(**args)
+            try:
+                result = method(**args)
+            except Error as exc:
+                # A refusal can be a session's first call (a send with no handle), so it carries the suggestion too.
+                exc.suggested_handle = self.suggest_name(verb)
+                raise
             done = True
+            suggested = self.suggest_name(verb)
+            if suggested:
+                result["suggested_handle"] = suggested
         finally:
             # The pending-name catch-up runs once, after the verb and its permission check,
             # never after a refusal and never from `sessions`, `messages` or `setup`.
@@ -108,6 +118,33 @@ class Core:
         if self.store.warnings:
             result.setdefault("warnings", []).extend(self.store.warnings)
         return result
+
+    def suggest_name(self, verb):
+        """The one generated name a session is ever suggested: on the first call after which it holds no handle
+        and has no open offer, recorded by a `suggested` line. Never for a spawned agent, an unknown caller or a
+        plain shell, and never after `release`, since the user has just given the handle up. Best effort: a
+        lock that can't be had or a store that can't be read suggests nothing."""
+        from . import names
+        identity = self.identity
+        key = identity.session_key
+        if verb == "release" or identity.classification != "root" or not key or identity.parent_key:
+            return None
+        try:
+            if held(handles(self.store), key) or self.was_suggested(key) or open_offers(self.store, session_key=key):
+                return None
+            with self.store.locked(deadline=time.monotonic() + 1):
+                if held(handles(self.store), key) or self.was_suggested(key):
+                    return None
+                name = names.free(self.store)
+                self.store.append(PERSONAS, {"at": now(), "session_key": key, "suggested": name})
+            return name
+        except (TimeoutError, OSError, LookupError) as exc:
+            self.store.log(f"suggest {key}: nothing suggested: {type(exc).__name__}: {exc}")
+            return None
+
+    def was_suggested(self, key):
+        return any(row.get("session_key") == key and isinstance(row.get("suggested"), str)
+                   for row in self.store.rows(PERSONAS))
 
     def help(self):
         from . import build

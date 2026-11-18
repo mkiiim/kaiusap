@@ -17,7 +17,7 @@ from kaiusap.adapters import SPAWNED_AGENT_TEXT
 from kaiusap.adapters.claude import LISTING_ERROR, NO_RECORD, ClaudeAdapter
 from kaiusap.adapters.codex import NO_THREAD
 from kaiusap.cli import render
-from kaiusap.core import RULES, VERBS
+from kaiusap.core import RULES, SUGGESTION, VERBS
 from kaiusap.errors import Error
 from kaiusap.mcp import TOOLS, arguments, description, instructions, schema
 from kaiusap.store import now
@@ -123,16 +123,21 @@ def shape(result, verb):
     expected = render(verb, dict(structured))
     for warning in structured.get("warnings") or []:
         expected += "\nWarning: " + warning
+    if structured.get("suggested_handle"):
+        expected += "\n" + SUGGESTION.format(structured["suggested_handle"])
     assert text == expected
     return structured
 
 
 def refusal(result, code=1):
+    """A refusal is one line, and the one-time name suggestion when it carries one."""
     assert result.is_error
     text, structured = result.content[0].text, result.structured_content
-    assert text.startswith("kaiusap: ") and "\n" not in text
-    assert structured == {"schema": 1, "error": text, "code": code}
-    return text
+    error, _, suggestion = text.partition("\n")
+    assert error.startswith("kaiusap: ") and "\n" not in suggestion
+    assert suggestion == (SUGGESTION.format(structured["suggested_handle"]) if "suggested_handle" in structured else "")
+    assert {k: v for k, v in structured.items() if k != "suggested_handle"} == {"schema": 1, "error": error, "code": code}
+    return error
 
 
 def codex_start(store, thread, cwd="/fixture", **extra):
