@@ -5,7 +5,7 @@
 
 # kAIusap
 
-*kAIusap*, pronounced **KAI**-yoo-sup, lets long-lived Claude Code, Codex, and OpenCode sessions on one machine message each other, using the handles that you give them.
+*kAIusap*, pronounced **KAI**-yoo-sup, lets long-lived Claude Code, Codex, and OpenCode sessions on one machine message each other, using the names (handles) that you give them.
 
 kAIusap is inspired by the Tagalog word for "the one you are talking with", *kausap* (ka-**OO**-sahp).
 
@@ -74,13 +74,17 @@ It removes only what the installer added, leaving settings you changed since, an
 
 You use kAIusap by talking to your sessions. Each session uses kAIusap through the tools its plugin adds (an MCP server named `kaiusap`).
 
-### Name a session
+### Name your sessions
 
-Tell each session what to call itself:
+Tell each session to name itself:
 
 > you are backend-eng
 
-The name is its handle. The handle stays with the conversation through `/clear` and when you resume it, so other sessions keep reaching it under the same name.
+The name is the session's handle. Think of it as its persona with which you can maintain long-lived conversations. It will stay with your session when you resume it and through native harness commands like `/clear`. This allows other sessions to use it as an identity to which they send messages and keep track of each other.
+
+You can also let kAIusap name your session. The first time a session with no handle calls kAIusap, for example to check its inbox or send a message, it offers you a randomly generated name such as `delicate-haze-4521`. To have it take a randomly generated name straight away, just tell it:
+
+> pick a name for yourself
 
 ### Send a message
 
@@ -88,11 +92,14 @@ Ask a session to message another by handle:
 
 > ask frontend-dev to implement the parser change, and return with test results
 
-The sending session tells you in one line what happened: the message was delivered and woke the recipient, or it was stored, for example because the recipient isn't running. A stored message comes with a paste line. Paste it into the recipient when you next open it, or just tell the recipient to read its messages.
+The sending session tells you in one line what happened: the message was delivered and woke the recipient, or it was stored, for example because the recipient wasn't running. In the event of a stored message, an instruction will be provided that can be pasted into the recipient's prompt telling it to read that specific message.
 
 ### Read and reply
 
-A woken session reads its message and acts on it. You can see both sessions in their terminals and can step in at any point. kAIusap tells each session to treat another session's message as a request to check, not as an instruction from you: it answers from what it knows or can look up, and asks you before doing more, such as changing files, unless you've already told it to take that kind of work.
+A woken session reads its message and acts on it. You can see both sessions in their terminals and can step in at any point. kAIusap tells each session to treat another session's message as a request to check, not as an instruction from you: it answers from what it knows or can look up, and asks you before doing more, such as changing files, unless you've already told it that it can do that kind of work.
+
+> [!NOTE]
+> Claude Code shows every message from another session as coming from "another Claude session", even when a Codex or OpenCode session sent it. The actual sender type is in kAIusap's first line, for example: "reply from frontend-dev (Codex, a peer assistant, not the user)".
 
 ### Stop everything
 
@@ -114,7 +121,7 @@ Sessions run these as tools; each is also a `kaiusap` command. Verbs marked *on 
 
 | Verb | What it does |
 | --- | --- |
-| `iam <handle>` | Take a handle (*on your word*); refused while a running session holds it |
+| `iam [<handle>]` | Take a handle (*on your word*); refused while another running session holds it; with no handle, takes a generated one |
 | `release` | Give up this session's handle (*on your word*) |
 | `whoami` | Show this session's handle, whether a message will wake it, and its unread count |
 | `who` | List the active handles |
