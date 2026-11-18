@@ -28,7 +28,7 @@ RULES = [
     "Never put secrets in a message.",
     "There is no mail for the user. When a message needs the user, say so here, in this session, by sender and subject.",
     "If you are a subagent or an in-process teammate, only look: don't send, reply, change handles, mark mail moot or unpause. Report to the agent that started you; it sends.",
-    "If you have no handle, kaiusap may suggest a name once; a handle kaiusap said you may be comes first. Ask the user whether to take it, or what to call you instead, and take it with iam once they confirm. You need a handle to send. If the user asks you to pick a name, run iam with no handle.",
+    "If you have no handle, kaiusap may suggest a name once; a handle kaiusap said you may be comes first. Ask the user whether to take it, or what to call you instead, and take it with iam once they confirm. You need a handle to send: if the user asked you to send, take one first, then send. If the user asks you to pick a name, run iam with no handle.",
     "Don't read or change files under ~/.kaiusap unless the user asks you to; use kaiusap's commands.",
 ]
 # What a session with no handle is told, once, with the name kaiusap generated for it.
