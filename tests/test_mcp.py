@@ -17,7 +17,7 @@ from kaiusap.adapters import SPAWNED_AGENT_TEXT
 from kaiusap.adapters.claude import LISTING_ERROR, NO_RECORD, ClaudeAdapter
 from kaiusap.adapters.codex import NO_THREAD
 from kaiusap.cli import render
-from kaiusap.core import RULES, VERBS
+from kaiusap.core import RULES, SUGGESTION, VERBS
 from kaiusap.errors import Error
 from kaiusap.mcp import TOOLS, arguments, description, instructions, schema
 from kaiusap.store import now
@@ -123,16 +123,21 @@ def shape(result, verb):
     expected = render(verb, dict(structured))
     for warning in structured.get("warnings") or []:
         expected += "\nWarning: " + warning
+    if structured.get("suggested_handle"):
+        expected += "\n" + SUGGESTION.format(structured["suggested_handle"])
     assert text == expected
     return structured
 
 
 def refusal(result, code=1):
+    """A refusal is one line, and the one-time name suggestion when it carries one."""
     assert result.is_error
     text, structured = result.content[0].text, result.structured_content
-    assert text.startswith("kaiusap: ") and "\n" not in text
-    assert structured == {"schema": 1, "error": text, "code": code}
-    return text
+    error, _, suggestion = text.partition("\n")
+    assert error.startswith("kaiusap: ") and "\n" not in suggestion
+    assert suggestion == (SUGGESTION.format(structured["suggested_handle"]) if "suggested_handle" in structured else "")
+    assert {k: v for k, v in structured.items() if k != "suggested_handle"} == {"schema": 1, "error": error, "code": code}
+    return error
 
 
 def codex_start(store, thread, cwd="/fixture", **extra):
@@ -187,7 +192,7 @@ def test_input_schemas_follow_the_table():
     assert send["required"] == ["to", "subject", "reply_needed"] and send["properties"]["subject"]["maxLength"] == 80
     assert set(send["properties"]) == {"to", "subject", "reply_needed", "request", "expected_output", "context", "current_state", "constraints", "starting_points"}
     assert reply["required"] == ["id", "body", "reply_needed"] and "request" not in reply["properties"]
-    assert schema("iam")["required"] == ["handle"] and schema("read")["required"] == ["id"]
+    assert schema("iam")["required"] == [] and schema("read")["required"] == ["id"]
     assert set(schema("moot")["properties"]) == {"id", "reason"} and schema("moot")["required"] == ["id"]
     assert set(schema("inbox")["properties"]) == {"all", "sent"} and set(schema("pause")["properties"]) == {"reason"}
     for tool in ("whoami", "who", "release", "unpause", "help"):
@@ -255,7 +260,7 @@ def test_listing_over_stdio_and_bad_arguments(rig):
             assert refusal(await call(client, "nope"), 64) == "kaiusap: Unknown tool nope. Run kaiusap help."
             assert refusal(await call(client, "read", {"id": "x", "all": True})) == "kaiusap: Arguments not allowed for this tool: all. Check kaiusap help."
             assert refusal(await call(client, "inbox", {"all": "yes"}, T1)) == "kaiusap: all must be a boolean. Check kaiusap help."
-            assert refusal(await call(client, "iam", {}, T1)) == "kaiusap: iam requires handle."
+            assert refusal(await call(client, "read", {}, T1)) == "kaiusap: read requires id."
             assert refusal(await call(client, "send", {"to": "b"}, T1)) == "kaiusap: send requires subject, reply_needed."
     run(scenario())
 

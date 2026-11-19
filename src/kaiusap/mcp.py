@@ -11,7 +11,7 @@ import sys
 
 from .adapters import ADAPTERS, Identity, Providers
 from .cli import render
-from .core import Core, rule_lines
+from .core import SUGGESTION, Core, rule_lines
 from .errors import Error, store_error
 from .model import FIELDS, last_directory
 from .store import Store
@@ -29,7 +29,8 @@ SUMMARIES = {
     "who": "List the active handles: each one's provider, directory, name, whether it is reachable, and its unread count.",
     "iam": ("Take a handle for this session, on the user's word ('you are <handle>'). A handle a running session holds is refused; "
             "one from a stopped session moves here, and its earlier mail stays with that session unless kaiusap offered you "
-            "the handle. The result says which."),
+            "the handle. The result says which. With no handle, kaiusap picks a free generated name and takes it, "
+            "for when the user asks you to pick a name."),
     "release": "Release this session's handle, on the user's word.",
     "send": ("Send a new message to a handle. reply_needed says whether you expect an answer. Body fields: with reply_needed true, "
              "request and expected_output are required; with false, context is. context, current_state, constraints and "
@@ -70,7 +71,7 @@ SCHEMAS = {
                              **{name: STRING for name in sorted(FIELDS - {"body", "request"})}},
               "required": ["id", "body", "reply_needed"],
               "allOf": [when(True, ["expected_output"])]},
-    "iam": {"properties": {"handle": STRING}, "required": ["handle"]},
+    "iam": {"properties": {"handle": STRING}, "required": []},
     "read": {"properties": {"id": STRING}, "required": ["id"]},
     "moot": {"properties": {"id": STRING, "reason": STRING}, "required": ["id"]},
     "inbox": {"properties": {"all": BOOLEAN, "sent": BOOLEAN}},
@@ -194,6 +195,8 @@ def call(provider, tool, given, meta):
         text = render(verb, dict(result)) or ""
         for line in result.get("warnings") or []:
             text += ("\n" if text else "") + "Warning: " + line
+        if result.get("suggested_handle"):
+            text += ("\n" if text else "") + SUGGESTION.format(result["suggested_handle"])
         return text, result, False
     except (OSError, ValueError) as exc:
         error = store_error(exc)
@@ -204,6 +207,10 @@ def call(provider, tool, given, meta):
             providers.finish(catch_up=False)  # a lookup that ended the call early leaves no connection open
     text = "kaiusap: " + str(error).replace("\n", " ").replace("\r", " ")
     structured = {"schema": 1, "error": text, "code": error.code}
+    suggested = getattr(error, "suggested_handle", None)
+    if suggested:
+        text += "\n" + SUGGESTION.format(suggested)
+        structured["suggested_handle"] = suggested
     stale = stale_warning()
     if stale:
         # A refused call carries the notice too: it may be the only call the model makes.

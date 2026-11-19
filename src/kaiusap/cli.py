@@ -6,7 +6,7 @@ import sys
 
 from .adapters import Identity, Providers, display_name
 from .build import label
-from .core import PLAIN_SHELL_STOP, Core, VERBS, rule_lines
+from .core import PLAIN_SHELL_STOP, SUGGESTION, Core, VERBS, rule_lines
 from .errors import Error, store_error
 from .model import FIELDS
 from .store import Store, instant
@@ -82,9 +82,10 @@ def parse(argv, stdin):
     if len(positionals) > expected:
         raise Error("Unexpected positional argument. Run kaiusap help.", 64)
     if expected:
-        if not positionals:
+        if positionals:
+            args[POSITIONAL[verb]] = positionals[0]
+        elif verb != "iam":  # `iam` with no handle takes a generated name
             raise Error(f"{verb} requires {POSITIONAL[verb]}.")
-        args[POSITIONAL[verb]] = positionals[0]
     if verb in {"send", "reply"}:
         args["fields"] = {k: args.pop(k) for k in list(args) if k in FIELDS}
     return verb, args
@@ -130,7 +131,10 @@ def render(verb, result):
     if verb == "version":
         return "kaiusap " + label(r)
     if verb == "iam":
-        text = f"{r['handle']} {'already' if r['already_held'] else 'now'} points to this session."
+        if r.get("generated"):
+            text = f"kaiusap picked `{r['handle']}`; it now points to this session."
+        else:
+            text = f"{r['handle']} {'already' if r['already_held'] else 'now'} points to this session."
         if r["moved_from"]:
             old = r["moved_from"]
             text += f" Moved from the {display_name(old['provider'])} session in {old['cwd'] or '(unknown directory)'}, named {old['name'] or '(unknown)'}."
@@ -269,14 +273,22 @@ def main(argv=None, *, store=None, provider=None, identity=None, stdin=None, std
                 print(text, file=stdout)
             for warning in result.get("warnings") or []:
                 print("Warning: " + warning, file=stdout)
+            if result.get("suggested_handle"):
+                print(SUGGESTION.format(result["suggested_handle"]), file=stdout)
         return 0
     except (OSError, ValueError) as exc:
         error = store_error(exc)
     except Error as exc:
         error = exc
     text = "kaiusap: " + str(error).replace("\n", " ").replace("\r", " ")
+    suggested = getattr(error, "suggested_handle", None)
     if as_json:
-        print(json.dumps({"schema": 1, "error": text, "code": error.code}), file=stdout)
+        refusal = {"schema": 1, "error": text, "code": error.code}
+        if suggested:
+            refusal["suggested_handle"] = suggested
+        print(json.dumps(refusal), file=stdout)
     else:
         print(text, file=stderr)
+        if suggested:
+            print(SUGGESTION.format(suggested), file=stderr)
     return error.code
