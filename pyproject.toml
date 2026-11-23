@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kaiusap"
-version = "0.3.0"
+version = "0.4.0"
 description = "Message assistant sessions on this machine by handle"
 requires-python = ">=3.12"
 license = "Apache-2.0"

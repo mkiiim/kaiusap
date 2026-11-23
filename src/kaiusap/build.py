@@ -17,7 +17,7 @@ def version():
     try:
         return installed("kaiusap")
     except PackageNotFoundError:
-        return "0.3.0"
+        return "0.4.0"
 
 
 def installed(record=None):
