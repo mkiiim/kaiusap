@@ -70,6 +70,12 @@ def test_version_runs_from_a_plain_shell_and_writes_nothing(record, store):
     assert run(store, "version")[0] == 0 and not store.root.exists()
 
 
+def test_dash_dash_version_is_the_version_verb(record, store):
+    record()
+    assert run(store, "--version") == run(store, "version")
+    assert run(store, "--version", "--json") == run(store, "version", "--json")
+
+
 def test_whoami_and_help_carry_the_build(record, store):
     record()
     assert json.loads(run(store, "whoami", "--json")[1])["kaiusap"]["commit"] == COMMIT
