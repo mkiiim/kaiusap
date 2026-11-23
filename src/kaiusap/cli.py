@@ -28,6 +28,8 @@ def provider_setup_flags():
 
 
 def parse(argv, stdin):
+    if argv and argv[0] == "--version":
+        argv = ["version", *argv[1:]]  # the usual spelling of `kaiusap version`
     if not argv or argv[0] not in VERBS:
         raise Error("Unknown or unavailable verb. Run kaiusap help.", 64)
     verb = argv[0]
