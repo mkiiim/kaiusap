@@ -93,9 +93,11 @@ class Told(str):
 
 
 def clear_suggestion(name):
-    """The suggestion on a /clear kaiusap couldn't follow, made as an offer."""
-    return (f"You may be `{name}`: this conversation began with a /clear kaiusap couldn't follow, and {name}'s session "
-            "was in this directory. Ask the user whether this is that assistant continuing.")
+    """The suggestion on a /clear whose session left kaiusap couldn't find, made as an offer; its resume command
+    differs per test."""
+    return Told(re.escape(f"This conversation began with a /clear. {name}'s session was in this directory; if that is "
+                          f"the conversation left, {name} stays with it: ") + ".*" +
+                re.escape(f". The user can say 'you are {name}' to carry on as {name} here."))
 
 
 def tmux_name_suggestion(name, before=""):

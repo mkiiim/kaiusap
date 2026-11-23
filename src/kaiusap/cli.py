@@ -11,11 +11,12 @@ from .errors import Error, store_error
 from .model import FIELDS
 from .store import Store, instant
 
-FLAGS = FIELDS | {"to", "subject", "reply_needed", "all", "sent", "reason", "since", "preview"}
+FLAGS = FIELDS | {"to", "subject", "reply_needed", "all", "sent", "reason", "since", "preview", "confirmed"}
 ALLOWED = {
     "send": FIELDS - {"body"} | {"to", "subject", "reply_needed"},
     "reply": FIELDS - {"request"} | {"reply_needed"},
     "inbox": {"all", "sent"}, "pause": {"reason"}, "moot": {"reason"}, "messages": {"since", "preview"},
+    "iam": {"confirmed"},
 }
 POSITIONAL = {"iam": "handle", "reply": "id", "read": "id", "moot": "id"}
 
@@ -45,7 +46,7 @@ def parse(argv, stdin):
             raise Error(f"Unknown flag --{flag}. Run kaiusap help.", 64)
         if key in args:
             raise Error(f"Repeated flag --{flag}. Supply it once.", 64)
-        if key in {"all", "sent", "preview"}:
+        if key in {"all", "sent", "preview", "confirmed"}:
             if equals:
                 raise Error(f"--{flag} takes no value.", 64)
             value = True
@@ -284,6 +285,8 @@ def main(argv=None, *, store=None, provider=None, identity=None, stdin=None, std
     suggested = getattr(error, "suggested_handle", None)
     if as_json:
         refusal = {"schema": 1, "error": text, "code": error.code}
+        if getattr(error, "reason_code", None):
+            refusal["reason_code"] = error.reason_code
         if suggested:
             refusal["suggested_handle"] = suggested
         print(json.dumps(refusal), file=stdout)

@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 import json
 import os
 import re
+import shlex
 import time
 
 from . import SPAWNED_AGENT_TEXT, UNIDENTIFIED_CLOSE, Identity, context_use, tmux
@@ -119,6 +120,8 @@ class OpenCodeAdapter(TerminalProcesses):
     screen_events = frozenset({"tool.execute.before"})
     screened_tools = SCREENED_TOOLS
     setup_flags = frozenset({"opencode", "opencode_config", "opencode_command"})  # choosing the OpenCode provider
+    session_noun = "session"
+    shown_stays = False  # the plugin's toast passes
 
     @classmethod
     def claims(cls, environment):
@@ -513,6 +516,30 @@ class OpenCodeAdapter(TerminalProcesses):
         """A text the plugin adds to the prompt as a part the model reads and the TUI doesn't show."""
         return {"hookSpecificOutput": {"tell": text}}
 
+    def show(self, text, event="chat.message"):
+        """A line for the user: the plugin shows it as a toast in the TUI."""
+        return {"hookSpecificOutput": {"toast": text}}
+
+    def resume_command(self, session_key, cwd):
+        from ..model import last_directory
+        session = session_key.split(":", 1)[1]
+        command = f"opencode -s {shlex.quote(session)}"
+        directory = last_directory(self.store, session_key)
+        if directory and cwd and os.path.normpath(directory) != os.path.normpath(cwd):
+            command = f"cd {shlex.quote(directory)} && {command}"
+        return command
+
+    def name_fresh(self, event, handle, name):
+        """A fresh start's new session is named by the `title` output of its first prompt, which follows its
+        start at once: the name is recorded as wanted here."""
+        self.fresh_named(event, handle, name, False)
+        return []
+
+    def fresh_named(self, event, handle, name, applied, retry=False):
+        self.store.event("named", handle=handle, session_id=event["session_id"], session_key=event["session_key"],
+                         binding=None, name=name if applied else None, wanted=name, kind="fresh", retry=retry,
+                         by_session=event["session_id"], by_session_key=event["session_key"], deadline=event.get("deadline"))
+
     # ----- naming ---------------------------------------------------
 
     def hook_output(self, event, state):
@@ -523,6 +550,7 @@ class OpenCodeAdapter(TerminalProcesses):
     def marker_fields(self, state, event):
         """The marker's OpenCode fields, read back by the native part's `clean`: the title
         rule for the next prompt."""
+        from ..model import fresh_pending
         title_mode, title = "any", None
         events, binding = state.data["events"], state.binding
         if binding:
@@ -534,6 +562,8 @@ class OpenCodeAdapter(TerminalProcesses):
         retired = {e.get("binding") for e in events if e.get("event") == "named" and e.get("kind") == "retired"}
         if any(b["id"] not in retired for b, _ in state.data["ended"]):
             title_mode = "work"
+        if not binding and fresh_pending(events, state.key):
+            title_mode = "work"  # a fresh session's name still to set
         return {"title_mode": title_mode, "title": title}
 
     def named(self, binding, name, kind, event, retry=False):
@@ -551,7 +581,7 @@ class OpenCodeAdapter(TerminalProcesses):
         """The hook naming rules, as for Claude's hooks, with the input's `title` (a default title is no name) as the
         current name; the output's `title` is set with `session.update`. The tmux session name follows the name
         applied, or at start a current name equal to the handle's."""
-        from ..model import binding_history, held, retirement_name
+        from ..model import binding_history, fresh_pending, held, retirement_name
         if event.get("agent_id") or event.get("kind") not in {"startup", "resume", "fork", "prompt"}:
             return {}
         ended, bindings = event.get("history") or binding_history(self.store)
@@ -584,6 +614,10 @@ class OpenCodeAdapter(TerminalProcesses):
             self.named(binding, name, "retired", event)
             if name:
                 output = name
+        pending = None if handle else fresh_pending(retirement_events, key)
+        if pending and output is None and event["kind"] == "prompt" and title in (None, pending["handle"]):
+            output = pending["wanted"]
+            self.fresh_named(event, pending["handle"], output, True, retry=True)
         follow = handle if output is None and event["kind"] in {"startup", "resume"} and handle and title == handle else output
         if follow is not None:
             self.hook_session_name(event, follow)
@@ -901,6 +935,8 @@ class OpenCodeAdapter(TerminalProcesses):
         return proposal
 
     def step_fork(self, event, store):
+        """A copy whose title names a handle whose session is live in this process: the user is moved into it, and
+        the handle moves. One whose title names another handle of this provider is offered it."""
         from ..model import handles
         match = FORK.match(event.get("raw_title") or "")
         bindings = handles(store)
@@ -909,8 +945,13 @@ class OpenCodeAdapter(TerminalProcesses):
         if binding and binding.get("provider") == PROVIDER:
             record = self.live_record(root_of(binding["session_key"]))
             if record and (record.get("pid"), record.get("process_started_at")) == (event.get("pid"), event.get("process_started_at")):
-                return {"text": f"This conversation is a copy of the one holding {original}, which keeps it; you have no handle.",
+                sid = binding["session_id"]
+                return {"move": {"handle": original, "from": binding["session_key"], "to": event["session_key"],
+                                 "reason": "copy", "via": None},
+                        "text": f"You are {original}; the handle followed this conversation from session {sid}, which it replaced in this terminal.",
+                        "failed": f"You may be {original}: this conversation replaced its session in this terminal, but kaiusap couldn't follow it in time. Ask the user.",
                         "suggest": False}
+            return {"suggest": False, "copy_of": {"handle": original, "from": binding["session_key"]}}
         return {"text": COPY, "suggest": False}
 
     def step_clear(self, event, store):
@@ -943,23 +984,12 @@ class OpenCodeAdapter(TerminalProcesses):
                 stop = max(stop, at - timedelta(seconds=3))
         if not predecessor:
             return None
-        bindings = handles(store)
-        name = held(bindings, f"{PROVIDER}:{predecessor}")
+        # The handle stays with the session left; the new one is told, named and offered it. A session left
+        # that holds no handle: nothing is said.
+        name = held(handles(store), f"{PROVIDER}:{predecessor}")
         if not name:
-            # The predecessor holds no handle, but /new still continues its persona, on the move's
-            # own condition: its latest live start record is this process's.
-            live = self.live_record(predecessor)
-            if live and (live.get("pid"), live.get("process_started_at")) == (pid, started):
-                return {"persona": {"continues": f"{PROVIDER}:{predecessor}", "via": "fresh-start"}}
-            return None
-        live = self.live_record(predecessor)
-        if not live or (live.get("pid"), live.get("process_started_at")) != (pid, started):
-            return None  # another running process receives its mail: no move, and on to step 4
-        return {"move": {"handle": name, "from": f"{PROVIDER}:{predecessor}", "to": event["session_key"],
-                         "reason": "fresh-start", "via": None},
-                "text": f"You are {name}; the handle followed this conversation from session {predecessor}, which it replaced in this terminal.",
-                "failed": f"You may be {name}: this conversation replaced its session in this terminal, but kaiusap couldn't follow it in time. Ask the user.",
-                "suggest": False}
+            return {"suggest": False}
+        return {"suggest": False, "fresh": {"handle": name, "from": f"{PROVIDER}:{predecessor}"}}
 
     def current(self, event, proposal):
         """Currency: the hook's own record is the newest, alone, among its process's root records."""

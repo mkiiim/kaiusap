@@ -1,7 +1,8 @@
 class Error(Exception):
-    def __init__(self, text, code=1):
+    def __init__(self, text, code=1, reason=None):
         super().__init__(text)
         self.code = code
+        self.reason_code = reason  # a machine-readable reason, for the refusals that have one
 
 
 def blocked(exc):

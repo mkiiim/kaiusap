@@ -103,7 +103,7 @@ def ended_by_state(state, line):
         ended.append(state.get(line["handle"]))
     if line.get("also_released"):
         ended.append(state.get(line["also_released"]))
-    if line.get("reason") in {"iam", "fresh-start", "rewind", "moved-directory", "moved-background"} and not line.get("moved_from"):
+    if line.get("reason") in {"iam", "fresh-start", "rewind", "moved-directory", "moved-background", "copy"} and not line.get("moved_from"):
         current = state.get(line["handle"])
         if current and current.get("session_key") != line.get("session_key"):
             ended.append(current)
@@ -199,7 +199,7 @@ def held(bindings, key):
 
 # The handle moves that continue a persona, and the file of continuations with no handle
 # and of offers. A move with a handle is read from its `handles.jsonl` line alone, so it is one write.
-CONTINUING = {"fresh-start", "rewind", "moved-directory", "moved-background"}
+CONTINUING = {"fresh-start", "rewind", "moved-directory", "moved-background", "copy"}
 PERSONAS = "sessions/personas.jsonl"
 
 
@@ -456,3 +456,12 @@ class MailView:
             if message and self.outcome(message)[0] != "stored":
                 candidates.append((e, message))
         return max(candidates, key=lambda pair: instant(pair[0]["at"]))[1] if candidates else None
+
+
+def fresh_pending(events, session_key):
+    """The name of a fresh start's new session still to apply: its latest `fresh` naming event, when that set no
+    name. None otherwise, or once it has been tried again."""
+    fresh = [e for e in events if e.get("event") == "named" and e.get("kind") == "fresh" and e.get("session_key") == session_key]
+    if not fresh or fresh[-1].get("name") is not None or any(e.get("retry") for e in fresh):
+        return None
+    return fresh[-1] if isinstance(fresh[-1].get("wanted"), str) else None

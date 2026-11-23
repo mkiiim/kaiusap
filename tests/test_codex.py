@@ -7,7 +7,9 @@ import time
 
 import pytest
 
-from conftest import clear_suggestion, tmux_name_suggestion
+import re
+
+from conftest import Told, clear_suggestion, tmux_name_suggestion
 
 from fake_codex import FakeDaemon, fake_codex
 from fake_tmux import FakeTmux
@@ -17,7 +19,7 @@ from kaiusap.adapters.daemon import run_command
 from kaiusap.core import Core
 from kaiusap.errors import Error
 from kaiusap.following import follow
-from kaiusap.model import MailView, handles, retirement_name
+from kaiusap.model import PERSONAS, MailView, handles, retirement_name
 from kaiusap.notice import notice, notice_id, paste_line
 from kaiusap.store import now
 
@@ -155,6 +157,34 @@ def send(a, to="beta", **overrides):
     args = {"to": to, "subject": "Review contract", "reply_needed": True,
             "fields": {"request": "Review it", "expected_output": "Mismatches"}}
     return a.run("send", args | overrides)
+
+
+def fresh_text(handle, thread, command, named=True):
+    """What a fresh start's new thread is told when the thread left holds `handle`; `named`: with a generated name."""
+    head = re.escape(f"This is a new conversation. It is not {handle}: {handle} stays with the conversation left in this "
+                     f"terminal, thread {thread}. To go back to it: {command}. This thread has no handle. The user can say "
+                     f"'you are {handle}' to carry on as {handle} here, or give it another name")
+    return Told(head + (r", for example [a-z]+-[a-z]+-\d{4}\." if named else r"\."))
+
+
+def fresh_shown(handle, command):
+    """The line the user is shown with it."""
+    return Told(re.escape(f"kaiusap: new conversation. {handle} stays with the one you left; to go back: {command}. To carry "
+                          f"on as {handle} here, say 'you are {handle}'; or name this thread") + r", for example [a-z]+-[a-z]+-\d{4}\.")
+
+
+def copy_text(handle):
+    return (f"This conversation is a copy of {handle}'s. It has no handle. To carry on as {handle} here, the user says "
+            f"'you are {handle}'.")
+
+
+def copy_shown(handle):
+    return (f"kaiusap: this conversation is a copy of {handle}'s and holds no handle. To carry on as {handle} here, "
+            f"say 'you are {handle}'.")
+
+
+def offers(store, key):
+    return [(row["offered"], row["from"]) for row in store.rows(PERSONAS) if row.get("session_key") == key and row.get("offered")]
 
 
 def live_pair(store, providers, runner, adapter):
@@ -805,7 +835,7 @@ def test_iam_sets_name_and_release_retires(store, providers, runner, adapter, da
     assert named[-1]["kind"] == "handle" and named[-1]["name"] == "alpha" and named[-1]["binding"] == handles(store)["alpha"]["id"]
     b = core(store, providers, T2)
     offer(store, f"codex:{T2}", "alpha", f"codex:{T1}")  # T1 is loaded, so taking its name needs an offer
-    b.run("iam", {"handle": "alpha"})
+    b.run("iam", {"handle": "alpha", "confirmed": True})
     # <handle>~<yymmddhhmmss>, the local time, to the second, of the line that moved the handle.
     left = datetime.fromisoformat(handles(store)["alpha"]["at"].replace("Z", "+00:00")).astimezone().strftime("%y%m%d%H%M%S")
     assert daemon.names[T1] == f"alpha~{left}" and daemon.names[T2] == "alpha"
@@ -864,14 +894,21 @@ def test_fork_lineage_moves_or_copies(store, providers, runner, adapter, daemon,
     assert not result["moved"] and handles(store)["alpha"]["session_key"] == f"codex:{T1}"
     assert result["texts"] == [f"You may be alpha: this conversation started from alpha's thread {T1}, in another directory. Ask the user whether this is alpha moving here (/cd, or continuing in a worktree) or a copy (/fork)."]
     adapter.reset()
-    taken = core(store, providers, T3, "/work/three").run("iam", {"handle": "alpha"})  # the user: "you are alpha"
+    # The user: "you are alpha". T1 is loaded (live), so the first call asks for the user's confirmation.
+    with pytest.raises(Error) as asked:
+        core(store, providers, T3, "/work/three").run("iam", {"handle": "alpha"})
+    assert asked.value.reason_code == "confirmation_needed" and asked.value.code == 1
+    assert handles(store)["alpha"]["session_key"] == f"codex:{T1}"
+    taken = core(store, providers, T3, "/work/three").run("iam", {"handle": "alpha", "confirmed": True})
     assert taken["continued"] and handles(store)["alpha"]["session_key"] == f"codex:{T3}"
     assert daemon.names[T3] == "alpha" and daemon.names[T1].startswith("alpha~")
     adapter.reset()
     daemon.threads[T3]["cwd"] = "/work/three"
     daemon.threads["019a1b2c-6666-7000-8000-000000000006"] = {"forkedFromId": T3, "cwd": "/work/three"}
     copy = follow(store, providers, event("fork", "019a1b2c-6666-7000-8000-000000000006", "/work/three"))
-    assert not copy["moved"] and copy["texts"] == ["This conversation is a copy of the one holding alpha, which keeps it; you have no handle."]
+    # No pane shows the copy, so the user wasn't moved into it: no handle, told so, and offered it.
+    assert not copy["moved"] and copy["texts"] == [copy_text("alpha")] and copy["shown"] == [copy_shown("alpha")]
+    assert offers(store, "codex:019a1b2c-6666-7000-8000-000000000006") == [("alpha", f"codex:{T3}")]
     adapter.reset()
     daemon.threads["019a1b2c-7777-7000-8000-000000000007"] = {"forkedFromId": ROOT}
     daemon.threads[ROOT] = {}
@@ -897,10 +934,17 @@ def test_fresh_start_follows_pane_predecessor(store, providers, runner, adapter,
                                               "thread_prefix": T1[:29], "thread_id": T1, "source": "read", "session_key": f"codex:{T1}"})
     adapter.reset()
     start(store, T2, "clear")
-    result = follow(store, providers, event("clear", T2))
-    assert result["moved"] and result["line"]["reason"] == "fresh-start" and result["line"]["moved_from"]["session_id"] == T1
-    assert result["texts"] == [f"You are alpha; the handle followed this conversation from thread {T1}, which it replaced in this terminal."]
-    assert handles(store)["alpha"]["session_key"] == f"codex:{T2}"
+    cleared = event("clear", T2)
+    result = follow(store, providers, cleared)
+    # The handle stays with the thread left; the new thread is told, shown a line, offered alpha and named.
+    assert not result["moved"] and result["proposal"]["fresh"] == {"handle": "alpha", "from": f"codex:{T1}"}
+    assert result["texts"] == [fresh_text("alpha", T1, f"codex resume {T1}")]
+    assert result["shown"] == [fresh_shown("alpha", f"codex resume {T1}")]
+    assert handles(store)["alpha"]["session_key"] == f"codex:{T1}"
+    assert offers(store, f"codex:{T2}") == [("alpha", f"codex:{T1}")]
+    assert daemon.names[T2] == retirement_name("alpha", cleared["at"]) and daemon.names[T1] == "alpha"
+    [named] = [e for e in store.events() if e["event"] == "named" and e["kind"] == "fresh"]
+    assert (named["session_key"], named["name"], named["handle"]) == (f"codex:{T2}", daemon.names[T2], "alpha")
 
 
 def test_fresh_start_prompt_line_predecessor_and_walk_with_via(store, providers, runner, adapter, daemon, codex_bin):
@@ -915,7 +959,8 @@ def test_fresh_start_prompt_line_predecessor_and_walk_with_via(store, providers,
                                                   "thread_prefix": thread[:29], "thread_id": thread, "source": "prompt", "session_key": f"codex:{thread}"})
     start(store, T3, "startup")
     result = follow(store, providers, event("startup", T3))
-    assert result["moved"] and result["line"]["via"] == [f"codex:{T2}"] and result["line"]["moved_from"]["session_id"] == T1
+    # The walk passes T2, which held nothing and was never prompted here, to alpha's T1.
+    assert not result["moved"] and result["proposal"]["fresh"] == {"handle": "alpha", "from": f"codex:{T1}"}
     adapter.reset()
     store.append("sessions/codex/terminals.jsonl", {"at": now(), "pane": key, "codex_pid": None, "codex_started_at": None,
                                               "thread_prefix": T2[:29], "thread_id": T2, "source": "prompt", "session_key": f"codex:{T2}"})
@@ -927,9 +972,11 @@ def test_fresh_start_prompt_line_predecessor_and_walk_with_via(store, providers,
     daemon.loaded.remove(T3)  # alpha's thread isn't running, so a /clear may suggest it (a loaded one is live)
     start(store, T4, "clear")
     stopped = follow(store, providers, event("clear", T4))
-    # T2, prompted here and holding nothing, is continued by T4, so alpha isn't offered.
-    assert not stopped["moved"] and stopped["texts"] == []
-    assert stopped["proposal"]["persona"] == {"continues": f"codex:{T2}", "via": "fresh-start"}
+    # T2, prompted here and holding nothing, is the thread left: nothing is said, alpha isn't offered, and no
+    # persona line is written for a conversation with no handle.
+    assert not stopped["moved"] and stopped["texts"] == [] and "persona" not in stopped["proposal"]
+    assert offers(store, f"codex:{T4}") == []
+    assert not [row for row in store.rows(PERSONAS) if row.get("continues")]
 
 
 def test_fresh_start_no_move_cases(store, providers, runner, adapter, daemon, codex_bin):
@@ -942,17 +989,16 @@ def test_fresh_start_no_move_cases(store, providers, runner, adapter, daemon, co
                                               "thread_prefix": T1[:29], "thread_id": T1, "source": "read", "session_key": f"codex:{T1}"})
     adapter.reset()
     start(store, T2, "startup", cwd="/work/two")
-    assert not follow(store, providers, event("startup", T2, "/work/two"))["moved"]
+    # Another directory: the handle stays all the same, and the new thread is told how to go back, with a `cd`.
+    other = follow(store, providers, event("startup", T2, "/work/two"))
+    assert not other["moved"] and other["texts"] == [fresh_text("alpha", T1, f"cd /work/one && codex resume {T1}")]
     adapter.reset()
     core(store, providers, T2, "/work/one").run("iam", {"handle": "beta"})
     guarded = follow(store, providers, event("clear", T2, "/work/one"))
-    assert not guarded["moved"] and guarded["texts"] == ["You hold beta; you may also be alpha, which this conversation continued. Tell the user."]
+    # A thread that holds a handle already is told nothing more.
+    assert not guarded["moved"] and guarded["texts"] == []
+    assert handles(store)["alpha"]["session_key"] == f"codex:{T1}" and handles(store)["beta"]["session_key"] == f"codex:{T2}"
     core(store, providers, T2, "/work/one").run("release", {})
-    adapter.reset()
-    at = iso(-5)
-    start(store, T2, "clear", cwd="/work/one", at=now())
-    stale = follow(store, providers, event("clear", T2, "/work/one", at=at))
-    assert not stale["moved"] and stale["texts"] == [] and "no longer current" in (store.root / "hook-errors.log").read_text()
     adapter.reset()
     runner.pane(T2[:29] + "...", tty="ttys002", pane_id="%2")
     runner.process(tty="ttys002", pid=300, started=-30)
@@ -979,7 +1025,7 @@ def test_fresh_start_without_pane_suggests_idle_and_tmux_named_handles(store, pr
     assert follow(store, providers, event("fork", T2, "/work/two"))["texts"] == ["This conversation was copied or moved from another one. Ask the user whether it should hold a handle."]
 
 
-def test_couldnt_follow_in_time(store, providers, runner, adapter, daemon, codex_bin):
+def test_a_fresh_start_without_the_lock_in_time_names_no_generated_name(store, providers, runner, adapter, daemon, codex_bin):
     key = runner.pane(T2[:29] + "...")
     runner.process(started=-30)
     core(store, providers, T1).run("iam", {"handle": "alpha"})
@@ -989,9 +1035,53 @@ def test_couldnt_follow_in_time(store, providers, runner, adapter, daemon, codex
     adapter.reset()
     start(store, T2, "clear")
     with store.locked():
-        result = follow(store, providers, event("clear", T2), deadline=time.monotonic() + .2)
+        result = follow(store, providers, event("clear", T2), deadline=time.monotonic() + 2)
+    # The generated name needs the global lock: without it the text has no example, and none is recorded.
     assert not result["moved"]
-    assert result["texts"] == ["You may be alpha: this conversation replaced its thread in this terminal, but kaiusap couldn't follow it in time. Ask the user."]
+    assert result["texts"] == [fresh_text("alpha", T1, f"codex resume {T1}", named=False)]
+    assert offers(store, f"codex:{T2}") == [("alpha", f"codex:{T1}")]
+    assert not [row for row in store.rows(PERSONAS) if row.get("suggested")]
+
+
+def test_a_fork_the_pane_switched_to_takes_the_handle(store, providers, runner, adapter, daemon, codex_bin):
+    # A /fork in the parent's directory, where the pane that showed the parent in this Codex process now shows
+    # the copy: the user was moved into it, so the handle moves, recorded `copy`.
+    key = runner.pane(T3[:29] + "...")
+    runner.process(started=-30)
+    daemon.threads[T3] = {"forkedFromId": T1}
+    daemon.loaded.append(T3)
+    core(store, providers, T1).run("iam", {"handle": "alpha"})
+    start(store, T1, at=iso(-20))
+    store.append("sessions/codex/terminals.jsonl", {"at": iso(-15), "pane": key, "codex_pid": 200, "codex_started_at": adapter.process_of(adapter.panes()[0])[1],
+                                              "thread_prefix": T1[:29], "thread_id": T1, "source": "read", "session_key": f"codex:{T1}"})
+    adapter.reset()
+    start(store, T3, "fork")
+    result = follow(store, providers, event("fork", T3))
+    assert result["moved"] and result["line"]["reason"] == "copy" and result["line"]["moved_from"]["session_id"] == T1
+    assert result["texts"] == [f"You are alpha; the handle followed this conversation from thread {T1}, which it replaced in this terminal."]
+    assert handles(store)["alpha"]["session_key"] == f"codex:{T3}"
+    assert daemon.names[T3] == "alpha" and daemon.names[T1].startswith("alpha~")
+
+
+def test_a_fresh_thread_name_without_the_daemon_waits_for_the_catch_up(store, providers, runner, adapter, daemon, tmp_path, monkeypatch, socket_dir):
+    # The new thread's `~` name can't be set with no daemon at its start: it is recorded as wanted and set by the
+    # next kaiusap call that reaches the daemon.
+    core(store, providers, T1).run("iam", {"handle": "alpha"})
+    path = os.environ["PATH"]
+    monkeypatch.setenv("PATH", str(tmp_path / "nobin"))
+    adapter.reset()
+    cleared = event("clear", T2)
+    wanted = retirement_name("alpha", cleared["at"])
+    warnings = adapter.name_fresh(cleared, "alpha", wanted)
+    assert "wasn't renamed" in warnings[0] and T2 not in daemon.names
+    [pending] = [e for e in store.events() if e["event"] == "named" and e["kind"] == "fresh"]
+    assert (pending["name"], pending["wanted"]) == (None, wanted)
+    monkeypatch.setenv("PATH", path)
+    adapter.reset()
+    core(store, providers, T1).run("whoami", {})
+    assert daemon.names[T2] == wanted
+    named = [e for e in store.events() if e["event"] == "named" and e["kind"] == "fresh"]
+    assert [(e["name"], e["retry"]) for e in named] == [(None, False), (wanted, True)]
 
 
 def hanging_ps(adapter, runner, monkeypatch, tty="ttys001"):
@@ -1621,7 +1711,7 @@ def test_codex_retirement_renames_before_the_mirror(store, providers, runner, ad
     core(store, providers, T1).run("iam", {"handle": "alpha"})
     assert fake_tmux.name(first) == "alpha"
     offer(store, f"codex:{T2}", "alpha", f"codex:{T1}")  # T1 is loaded, so taking its name needs an offer
-    result = core(store, providers, T2).run("iam", {"handle": "alpha"})
+    result = core(store, providers, T2).run("iam", {"handle": "alpha", "confirmed": True})
     retired = retirement_name("alpha", handles(store)["alpha"]["at"])
     assert result["warnings"] == [] and daemon.names == {T1: retired, T2: "alpha"}
     assert (fake_tmux.name(first), fake_tmux.name(second)) == (retired, "alpha")
@@ -1894,8 +1984,8 @@ class Terminal:
         r = _subprocess.run([str(self.native), *argv, "--json"], text=True, capture_output=True, timeout=25, env=env)
         return r.returncode, json.loads(r.stdout) if r.stdout.strip() else None
 
-    def iam(self, thread, handle, cwd="/fixture"):
-        code, result = self.verb(thread, "iam", handle, cwd=cwd)
+    def iam(self, thread, handle, cwd="/fixture", *extra):
+        code, result = self.verb(thread, "iam", handle, *extra, cwd=cwd)
         assert code == 0, result
 
     # ----- the store ---------------------------------------------------------------------------------
@@ -2097,18 +2187,25 @@ def test_checklist_fork_to_another_directory_asks_and_a_confirmation_continues(w
     text = world.start(T3, "fork", "/work/two")
     assert text == f"You may be alpha: this conversation started from alpha's thread {T1}, in another directory. Ask the user whether this is alpha moving here (/cd, or continuing in a worktree) or a copy (/fork)."  # asked, nothing moved
     assert world.holder("alpha") == f"codex:{T1}"
-    world.iam(T3, "alpha")  # the user confirms: the persona continues in T3, with its mail
+    # The user says "you are alpha"; T1 is loaded (live), so kaiusap asks the user to confirm first.
+    code, asked = world.verb(T3, "iam", "alpha")
+    assert code == 1 and asked["reason_code"] == "confirmation_needed" and world.holder("alpha") == f"codex:{T1}"
+    world.iam(T3, "alpha", "/fixture", "--confirmed")  # the user confirms: the persona continues in T3, with its mail
     line = world.handles()["alpha"]
     assert (line["session_key"], line["reason"], line["moved_from"]["session_key"]) == (f"codex:{T3}", "iam", f"codex:{T1}")
     assert world.daemon.names[T3] == "alpha" and world.daemon.names[T1].startswith("alpha~")
 
 
 def test_checklist_fork_in_the_same_directory_is_a_copy(world):
-    # Step 1: the same directory is a copy: no handle, told so.
+    # Step 1: the same directory, with no pane that switched from the parent to the copy: a copy, no handle,
+    # told so, shown the copy line, and offered the handle.
     held_by_t1(world)
     world.daemon.threads[T3] = {"forkedFromId": T1}
-    assert world.start(T3, "fork", "/work/one") == "This conversation is a copy of the one holding alpha, which keeps it; you have no handle."
+    out = world.hook("SessionStart", T3, "/work/one", source="fork")
+    assert out["hookSpecificOutput"]["additionalContext"] == SESSION_LINE + "\n" + copy_text("alpha")
+    assert out["systemMessage"] == copy_shown("alpha")
     assert world.holder("alpha") == f"codex:{T1}"
+    assert offers(world.store, f"codex:{T3}") == [("alpha", f"codex:{T1}")]
 
 
 def test_checklist_fork_walks_past_threads_without_a_start_record(world):
@@ -2192,27 +2289,29 @@ def replaced_in(world, holder, cwd="/fixture", prompted=True):
 
 
 @pytest.mark.parametrize("source", ["clear", "startup"])
-def test_checklist_fresh_start_in_the_same_directory_moves_the_handle(world, source):
-    # Step 2: T's `cwd` equal to the predecessor's: the handle moves, `fresh-start`, told
-    # "You are <handle>; ... which it replaced in this terminal." Named, and the old thread retired.
+def test_checklist_fresh_start_leaves_the_handle_and_names_the_new_thread(world, source):
+    # Step 2: the handle stays with the thread left. The new thread is told the fresh-session text, the user is
+    # shown its line, and the thread is named `<handle>~<yymmddhhmmss>`; the thread left keeps its name.
     world.iam(T1, "alpha")
     replaced_in(world, T1)
-    assert world.start(T2, source) == f"You are alpha; the handle followed this conversation from thread {T1}, which it replaced in this terminal."
-    line = world.handles()["alpha"]
-    assert (line["session_key"], line["reason"], line["via"]) == (f"codex:{T2}", "fresh-start", None)
-    assert world.daemon.names[T2] == "alpha" and world.daemon.names[T1].startswith("alpha~")
+    out = world.hook("SessionStart", T2, source=source)
+    told = out["hookSpecificOutput"]["additionalContext"].split("\n")
+    assert told[0] == SESSION_LINE and "\n".join(told[1:]) == fresh_text("alpha", T1, f"codex resume {T1}")
+    assert out["systemMessage"] == fresh_shown("alpha", f"codex resume {T1}")
+    assert world.holder("alpha") == f"codex:{T1}"
+    assert re.fullmatch(r"alpha~\d{12}", world.daemon.names[T2]) and world.daemon.names[T1] == "alpha"
+    assert offers(world.store, f"codex:{T2}") == [("alpha", f"codex:{T1}")]
 
 
-def test_checklist_a_moved_handle_keeps_the_threads_own_name(world):
-    # After a hook move the thread is named only when `thread/read` shows it has no name at all; the
-    # existing name is kept and the mirror counted done.
+def test_checklist_a_fresh_thread_keeps_its_own_name(world):
+    # A fresh thread is named only when `thread/read` shows it has no name, or the handle's; a name typed
+    # with /new is kept.
     world.iam(T1, "alpha")
     world.daemon.threads[T2] = {"name": "typed with /new"}
     replaced_in(world, T1)
-    assert world.start(T2, "clear").startswith("You are alpha;")
+    assert world.start(T2, "clear").startswith("This is a new conversation. It is not alpha:")
     assert T2 not in world.daemon.names
-    named = [e for e in world.events("named") if e.get("session_key") == f"codex:{T2}"]
-    assert [(e["kind"], e["name"]) for e in named] == [("handle", "typed with /new")]
+    assert [e for e in world.events("named") if e.get("session_key") == f"codex:{T2}"] == []
 
 
 def test_checklist_a_relaunch_moves_nothing(world):
@@ -2241,21 +2340,19 @@ def test_checklist_no_pane_moves_nothing_and_clear_suggests(world):
 
 
 def test_checklist_a_holder_in_another_directory_stays_and_is_told(world):
-    # Step 2: a different directory: no move, told "This terminal
-    # showed <handle> before, in <old directory>. ..." with the holder's directory and T's `cwd`. Step 4: no
-    # /clear suggestion though a candidate exists (beta, not live, last in T's directory).
+    # Step 2: a different directory is told the same fresh-session text, whose way back starts with a `cd`.
+    # Step 4: no /clear suggestion though a candidate exists (beta, not live, last in T's directory).
     world.iam(T1, "alpha", "/work/one")
     world.prompt(T5, "/work/two")
     world.iam(T5, "beta", "/work/two")
     world.daemon.loaded.remove(T5)
     replaced_in(world, T1, "/work/one")
-    assert world.start(T2, "clear", "/work/two") == ("This terminal showed alpha before, in /work/one. This conversation started in "
-                                                     "/work/two, so kaiusap left the handle there. Tell the user.")
+    assert world.start(T2, "clear", "/work/two") == fresh_text("alpha", T1, f"cd /work/one && codex resume {T1}")
     assert world.holder("alpha") == f"codex:{T1}" and world.holder("beta") == f"codex:{T5}"
 
 
 def test_checklist_a_holder_in_another_directory_still_gets_the_tmux_name_suggestion(world):
-    # Step 4: the tmux-name suggestion still applies to a thread step 2 told that the handle stayed.
+    # Step 4: the tmux-name suggestion still applies to a fresh thread told that the handle stayed.
     world.iam(T1, "alpha", "/work/one")
     world.iam(T5, "beta")
     world.daemon.loaded.remove(T5)
@@ -2263,31 +2360,31 @@ def test_checklist_a_holder_in_another_directory_still_gets_the_tmux_name_sugges
     world.codex()
     world.prompt(T1, "/work/one")
     world.title("%1", f"Codex | {T2}")
-    assert world.start(T2, "clear", "/work/two") == tmux_name_suggestion("beta", before="This terminal showed alpha before, in /work/one. This conversation started in /work/two, so kaiusap "
-                 "left the handle there. Tell the user.\n")
+    told = world.start(T2, "clear", "/work/two")
+    assert told.startswith("This is a new conversation. It is not alpha:")
+    assert told.split("\n", 1)[1] == tmux_name_suggestion("beta")
 
 
 def test_checklist_a_holder_whose_directory_cant_be_found(world):
-    # Step 2: the predecessor's directory found as in step 1, and when it can't be: no
-    # move, told "You may be <handle>: ... couldn't find that thread's directory. Tell the user."
+    # Step 2: the directory of the thread left doesn't matter: with none known, the way back has no `cd`.
     world.iam(T1, "alpha")
     world.daemon.threads[T1] = {"cwd": None, "name": "alpha"}
     replaced_in(world, T1, prompted=False)
-    assert world.start(T2, "clear") == ("You may be alpha: this conversation replaced its thread in this terminal, but kaiusap "
-                                        "couldn't find that thread's directory. Tell the user.")
+    assert world.start(T2, "clear") == fresh_text("alpha", T1, f"codex resume {T1}")
     assert world.holder("alpha") == f"codex:{T1}"
 
 
 def test_checklist_the_walk_back_passes_threads_holding_nothing(world):
     # Step 2: a predecessor holding nothing and never prompted in this process is walked
-    # past, to the first holder, with the threads passed in `via`.
+    # past, to the first holder, which is the thread left.
     world.iam(T1, "alpha")
     replaced_in(world, T1)
     world.title("%1", f"Codex | {T4}")
     world.verb(T4, "whoami")  # T4 shown, looked at, never prompted
     world.title("%1", f"Codex | {T2}")
-    assert world.start(T2, "clear").startswith(f"You are alpha; the handle followed this conversation from thread {T1}")
-    assert world.handles()["alpha"]["via"] == [f"codex:{T4}"]
+    assert world.start(T2, "clear").startswith(f"This is a new conversation. It is not alpha: alpha stays with the "
+                                               f"conversation left in this terminal, thread {T1}.")
+    assert world.holder("alpha") == f"codex:{T1}"
 
 
 def test_checklist_a_prompted_thread_holding_nothing_stops_the_walk(world):
@@ -2343,35 +2440,34 @@ def test_checklist_panes_with_no_holder_tell_nothing(world):
 
 def test_checklist_panes_that_walk_back_to_one_holder_move_it(world):
     # Step 2: each pane's predecessor is first resolved by the walk-back,
-    # then the holders compared; when every pane resolves to the same holder, the handle moves as for one.
+    # then the holders compared; when every pane resolves to the same holder, it is the thread left, as for one.
     # Pane %2 showed T4 (holding nothing, never prompted) after alpha's T1.
     world.iam(T1, "alpha")
     two_panes(world, T1, T1)
     world.title("%2", f"Codex | {T4}")
     world.verb(T4, "whoami")
     world.title("%2", f"Codex | {T2}")
-    assert world.start(T2, "clear") == f"You are alpha; the handle followed this conversation from thread {T1}, which it replaced in this terminal."
-    assert world.holder("alpha") == f"codex:{T2}"
-
-
-def test_checklist_a_destination_holding_a_handle_is_never_displaced(world):
-    # Through step 2: T already holds a handle: nothing moves, told "You hold <handle>; you
-    # may also be <other>, ...".
-    world.iam(T1, "alpha")
-    world.iam(T2, "beta")
-    replaced_in(world, T1)
-    assert world.start(T2, "clear") == "You hold beta; you may also be alpha, which this conversation continued. Tell the user."
+    assert world.start(T2, "clear") == fresh_text("alpha", T1, f"codex resume {T1}")
     assert world.holder("alpha") == f"codex:{T1}"
 
 
-def test_checklist_a_move_that_cant_be_made_in_time_says_so(world):
-    # Codex step 2: the holder identified, the global lock not
-    # had in time: no move, told the couldn't-follow text with "thread"; the start record is still written.
+def test_checklist_a_destination_holding_a_handle_is_never_displaced(world):
+    # Through step 2: T already holds a handle: nothing moves and nothing more is told.
+    world.iam(T1, "alpha")
+    world.iam(T2, "beta")
+    replaced_in(world, T1)
+    assert world.start(T2, "clear") == ""
+    assert world.holder("alpha") == f"codex:{T1}"
+
+
+def test_checklist_a_fresh_start_without_the_lock_names_no_generated_name(world):
+    # Codex step 2: the holder identified, the global lock not had in time: the fresh-session text without a
+    # generated name; the start record is still written.
     world.iam(T1, "alpha")
     replaced_in(world, T1)
     with world.store.locked():
         text = world.start(T2, "clear")
-    assert text == "You may be alpha: this conversation replaced its thread in this terminal, but kaiusap couldn't follow it in time. Ask the user."
+    assert text == fresh_text("alpha", T1, f"codex resume {T1}", named=False)
     assert world.holder("alpha") == f"codex:{T1}"
     assert [r["source"] for r in world.lines("sessions/starts.jsonl") if r["session_id"] == T2] == ["clear"]
 
@@ -2416,7 +2512,7 @@ def test_checklist_clear_suggests_only_a_handle_with_no_live_session(world):
     titled(world, T3, T4, T5)
     assert world.start(T3, "clear") == ""
     world.daemon.loaded.remove(T1)
-    assert "You may be `alpha`: this conversation began with a /clear" in world.start(T4, "clear")
+    assert "This conversation began with a /clear. alpha's session was in this directory" in world.start(T4, "clear")
     assert world.start(T5, "clear", "/elsewhere") == ""
 
 
@@ -2456,7 +2552,7 @@ def test_checklist_a_codex_candidate_is_live_unless_known_not_to_be(world, tmp_p
     assert told == (tmux_name_suggestion("alpha") if suggested else "")
     if answer != "timeout":  # a timeout spends the start hook's 3 s: the tmux-name case alone
         cleared = world.start(T4, "clear")
-        assert ("You may be `alpha`: this conversation began with a /clear" in cleared) is suggested
+        assert ("This conversation began with a /clear. alpha's session was in this directory" in cleared) is suggested
 
 
 # ----- naming --------------------------------------------------------------------------------
@@ -2495,12 +2591,9 @@ def offer(store, key, handle, holder):
     store.append(PERSONAS, {"at": now(), "session_key": key, "offered": handle, "from": holder})
 
 
-def test_checklist_a_clear_with_no_handle_still_continues_the_persona(world):
-    # A /clear no handle followed is still the persona; the pane's previous thread is
-    # recorded as continued, so its mail (none held) follows.
+def test_checklist_a_clear_after_a_thread_with_no_handle_says_nothing_and_continues_nothing(world):
+    # A conversation that holds no handle is never followed: a /clear after it says nothing and writes no
+    # persona line.
     replaced_in(world, T1)  # T1 held no handle
     assert world.start(T2, "clear") == ""
-    from kaiusap.model import PERSONAS
-    lines = list(world.store.rows(PERSONAS))
-    assert [(l["session_key"], l["continues"], l["via"], l["handle"]) for l in lines] == [
-        (f"codex:{T2}", f"codex:{T1}", "fresh-start", None)]
+    assert [row for row in world.store.rows(PERSONAS) if row.get("continues")] == []

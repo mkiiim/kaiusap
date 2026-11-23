@@ -15,6 +15,7 @@ import pytest
 
 from kaiusap.adapters import SPAWNED_AGENT_TEXT
 from kaiusap.mcp import call
+from kaiusap.model import handles
 from kaiusap.notice import SESSION_LINE, notice
 from kaiusap.store import Store
 
@@ -355,19 +356,28 @@ def test_a_session_whose_process_exited_is_not_live(machine):
     assert code == 0
 
 
-# ----- /new follows the session last typed in -------------------------------------------
+# ----- /new leaves the handle with the session last typed in -----------------------------
 
 
-def test_new_moves_the_handle_from_the_session_last_prompted_in_this_process(machine):
+def test_new_leaves_the_handle_and_tells_names_and_offers_the_new_session(machine):
     machine.serve({ROOT, NEXT})
     machine.hook("session.start")
     take(machine)
     machine.hook("chat.message")
     output = machine.hook("session.start", session=NEXT, roots_started_here=1,
                           prompted_roots=[{"session_id": ROOT, "at": "2026-11-10T00:00:00.000Z"}])
-    assert f"You are alpha; the handle followed this conversation from session {ROOT}, which it replaced in this terminal." in told(output)
-    line = list(machine.store.rows("handles.jsonl"))[-1]
-    assert (line["handle"], line["reason"], line["session_key"]) == ("alpha", "fresh-start", f"opencode:{NEXT}")
+    text = told(output)
+    assert (f"This is a new conversation. It is not alpha: alpha stays with the conversation left in this terminal, "
+            f"session {ROOT}. To go back to it: opencode -s {ROOT}.") in text
+    assert text.endswith("Tell the user this once, in your first reply.")
+    assert output["hookSpecificOutput"]["toast"].startswith("kaiusap: new conversation. alpha stays with the one you left")
+    assert handles(machine.store)["alpha"]["session_key"] == f"opencode:{ROOT}"
+    from kaiusap.model import open_offers
+    assert [(o["offered"], o["from"]) for o in open_offers(machine.store, session_key=f"opencode:{NEXT}")] == [
+        ("alpha", f"opencode:{ROOT}")]
+    # The `~` name is the title output of the new session's first prompt.
+    output = machine.hook("chat.message", session=NEXT)
+    assert output["hookSpecificOutput"]["title"].startswith("alpha~")
 
 
 def test_new_without_a_prompt_of_this_process_moves_nothing(machine):
@@ -388,17 +398,30 @@ def test_new_leaves_a_handle_whose_session_another_running_process_opened_later(
                           prompted_roots=[{"session_id": ROOT, "at": "2026-11-10T00:00:00.000Z"}])
     assert "You are alpha" not in (told(output) or "")
     assert list(machine.store.rows("handles.jsonl"))[-1]["session_key"] == f"opencode:{ROOT}"
-    assert told(output).startswith(SESSION_LINE)  # no move, then step 4: nothing else to say here
+    assert "This is a new conversation. It is not alpha" in told(output)
 
 
 # ----- a fork ------------------------------------------------------------------------------
 
 
-def test_a_fork_of_a_session_holding_a_handle_is_told_it_is_a_copy(machine):
+def test_a_fork_in_the_process_showing_the_handle_takes_it(machine):
     machine.hook("session.start")
     take(machine)
     output = machine.hook("session.start", session=NEXT, title="alpha (fork #1)", roots_started_here=1)
-    assert "This conversation is a copy of the one holding alpha, which keeps it; you have no handle." in told(output)
+    assert f"You are alpha; the handle followed this conversation from session {ROOT}, which it replaced in this terminal." in told(output)
+    line = list(machine.store.rows("handles.jsonl"))[-1]
+    assert (line["handle"], line["reason"], line["session_key"]) == ("alpha", "copy", f"opencode:{NEXT}")
+    assert output["hookSpecificOutput"]["title"] == "alpha"
+
+
+def test_a_fork_of_a_handle_open_in_another_process_is_offered_it(machine):
+    machine.hook("session.start", pid=OTHER_PID)
+    take(machine, pid=OTHER_PID)
+    output = machine.hook("session.start", session=NEXT, title="alpha (fork #1)", roots_started_here=1)
+    assert ("This conversation is a copy of alpha's. It has no handle. To carry on as alpha here, the user says "
+            "'you are alpha'. Tell the user this once, in your first reply.") in told(output)
+    assert output["hookSpecificOutput"]["toast"].startswith("kaiusap: this conversation is a copy of alpha's")
+    assert handles(machine.store)["alpha"]["session_key"] == f"opencode:{ROOT}"
 
 
 def test_a_fork_of_anything_else_is_told_it_has_no_handle(machine):
@@ -447,13 +470,11 @@ def test_sessions_rows_name_the_harness_maker(machine):
     assert row["harness_maker"] == "opencode" and row["context"] is None
 
 
-def test_new_with_no_handle_still_continues_the_persona(machine):
-    # The predecessor holds no handle, but /new still continues its persona.
+def test_new_after_a_session_with_no_handle_says_and_writes_nothing(machine):
     machine.hook("session.start")
     machine.hook("chat.message")
-    machine.hook("session.start", session=NEXT, roots_started_here=1,
-                 prompted_roots=[{"session_id": ROOT, "at": "2026-11-10T00:00:00.000Z"}])
+    output = machine.hook("session.start", session=NEXT, roots_started_here=1,
+                          prompted_roots=[{"session_id": ROOT, "at": "2026-11-10T00:00:00.000Z"}])
     from kaiusap.model import PERSONAS
-    lines = list(machine.store.rows(PERSONAS))
-    assert [(l["session_key"], l["continues"], l["via"]) for l in lines] == [
-        (f"opencode:{NEXT}", f"opencode:{ROOT}", "fresh-start")]
+    assert list(machine.store.rows(PERSONAS)) == []
+    assert told(output) == SESSION_LINE and "toast" not in output["hookSpecificOutput"]

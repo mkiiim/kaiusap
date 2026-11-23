@@ -623,54 +623,83 @@ def test_follow_no_move(rig, store, kind):
     assert not proposal.get('move')
 
 
-def test_clear_walk_and_base_move(rig, store):
+def test_clear_leaves_the_handle_and_places_the_new_session(rig, store):
     adapter, run, _ = rig
     start(store)
     bind(store, adapter)
-    start(store, 'middle', source='clear', at='2026-11-01T00:00:01Z')
-    item = event(store)
+    inbox = Inbox()
+    item = event(store, socket=inbox.path)
     run.rows = [{'pid': 10, 'sessionId': 'new'}]
     result = follow(store, Providers({'claude': adapter}, store), item, deadline=time.monotonic() + 3)
-    assert result['moved'] and result['line']['via'] == ['claude:middle']
-    assert result['line']['reason'] == 'fresh-start' and result['line']['pid'] == 10
-    assert result['texts'] == ['You are alpha; the handle followed this conversation from session old, which it replaced in this terminal.']
+    inbox.close()
+    assert not result['moved'] and handles(store)['alpha']['session_key'] == 'claude:old'
+    suggested = next(r['suggested'] for r in store.rows('sessions/personas.jsonl') if r.get('suggested'))
+    assert result['texts'] == [
+        "This is a new conversation. It is not alpha: alpha stays with the conversation left in this terminal, session "
+        "old. To go back to it: claude --resume old. This session has no handle. The user can say 'you are alpha' to "
+        f"carry on as alpha here, or give it another name, for example {suggested}."]
+    assert result['shown'] == [
+        "kaiusap: new conversation. alpha stays with the one you left; to go back: claude --resume old. To carry on as "
+        f"alpha here, say 'you are alpha'; or name this session, for example {suggested}."]
+    offers = [r for r in store.rows('sessions/personas.jsonl') if r.get('offered')]
+    assert offers == [{**offers[0], 'session_key': 'claude:new', 'offered': 'alpha', 'from': 'claude:old'}]
+    name = retirement_name('alpha', item['at'])
+    assert json.loads(inbox.data) == {'type': 'control', 'action': 'rename', 'name': name, 'session_id': 'new'}
+    named = [e for e in store.events() if e['event'] == 'named' and e['kind'] == 'fresh']
+    assert named[-1]['name'] == name and named[-1]['session_key'] == 'claude:new'
 
 
-@pytest.mark.parametrize('source,at,move', [('clear', '2026-11-01T00:00:01Z', True),
-    ('clear', '2026-10-31T23:59:57Z', False), ('resume', '2026-11-01T00:00:01Z', False)])
-def test_walk_stops(rig, store, source, at, move):
+def test_clear_without_a_socket_names_the_session_at_its_next_prompt(rig, store):
+    adapter, run, _ = rig
+    start(store)
+    bind(store, adapter)
+    item = event(store)
+    run.rows = [{'pid': 10, 'sessionId': 'new'}]
+    follow(store, Providers({'claude': adapter}, store), item, deadline=time.monotonic() + 3)
+    name = retirement_name('alpha', item['at'])
+    pending = [e for e in store.events() if e['event'] == 'named' and e['kind'] == 'fresh']
+    assert pending[-1]['name'] is None and pending[-1]['wanted'] == name
+    assert adapter.mirror_output(title_event(sid='new', title='alpha')) == {
+        'hookSpecificOutput': {'hookEventName': 'UserPromptSubmit', 'sessionTitle': name}}
+    assert adapter.mirror_output(title_event(sid='new')) == {}  # tried once more, then left
+
+
+@pytest.mark.parametrize('source,at', [('clear', '2026-11-01T00:00:01Z'), ('resume', '2026-11-01T00:00:01Z')])
+def test_clear_finds_only_the_session_just_left(rig, store, source, at):
+    # A quick second /clear finds the session the first one made, which holds no handle: nothing is said.
     adapter, _, _ = rig
     start(store, at='2026-10-31T23:59:50Z')
     bind(store, adapter)
     start(store, 'middle', source=source, at=at)
     proposal = adapter.follow_start(event(store), store)
-    assert bool(proposal.get('move')) is move
+    assert not proposal.get('move') and not proposal.get('fresh') and proposal['suggest'] is False
 
 
-@pytest.mark.parametrize('listed,alive_process,blocks', [(True, True, True), (False, True, True), (True, False, False)])
-def test_clear_receiving_process_test(rig, store, listed, alive_process, blocks):
+def test_clear_places_the_new_session_even_while_another_process_holds_the_old_one(rig, store):
     adapter, run, _ = rig
     start(store)
     start(store, 'old', 20, teammate=True)
     bind(store, adapter, pid=20)
-    item = event(store)
-    run.rows = [{'pid': 20, 'sessionId': 'old'}] if listed else []
-    if not alive_process:
-        run.processes.pop(20)
-    proposal = adapter.follow_start(item, store)
-    assert bool(proposal.get('move')) is not blocks
-    if blocks:
-        assert proposal['suggest'] is False
+    run.rows = [{'pid': 20, 'sessionId': 'old'}]
+    proposal = adapter.follow_start(event(store), store)
+    assert not proposal.get('move') and proposal['fresh'] == {'handle': 'alpha', 'from': 'claude:old'}
 
 
 def test_rewind_history_and_holder_predicates(rig, store):
+    # A binding a /clear made before handles stayed with the session left still moves back on a rewind.
     adapter, run, _ = rig
     start(store)
     bind(store, adapter)
+    start(store, 'new', at='2026-11-01T00:00:02Z', source='clear')
+    old = handles(store)['alpha']
+    at = '2026-11-01T00:00:03Z'
+    store.append('handles.jsonl', {'at': at, 'id': '20261101T000003Z-aaaaaa', 'handle': 'alpha', 'reason': 'fresh-start',
+                                   'session_id': 'new', 'session_key': 'claude:new', 'provider': 'claude',
+                                   'by_session': 'new', 'by_session_key': 'claude:new', 'pid': 10,
+                                   'process_started_at': START,
+                                   'moved_from': {'session_id': 'old', 'provider': 'claude', 'session_key': old['session_key']},
+                                   'via': None, 'also_released': None})
     run.rows = [{'pid': 10, 'sessionId': 'new'}]
-    first = follow(store, Providers({'claude': adapter}, store), event(store), deadline=time.monotonic() + 3)
-    assert first['moved']
-    # process line doesn't create a new binding or erase the rewind predicate.
     resume = {**event(store, 'old', kind='resume'), 'at': now()}
     proposal = adapter.follow_start(resume, store)
     assert proposal['move']['reason'] == 'rewind'
@@ -775,7 +804,9 @@ def test_suggestions_do_not_treat_missing_socket_as_dead(rig, store):
     adapter.reset()
     item = event(store, pid=20)
     result = follow(store, providers, item, deadline=time.monotonic() + 3)
-    assert not result['moved'] and 'You may be `alpha`: this conversation began with a /clear' in result['texts'][0]
+    assert not result['moved'] and result['texts'] == [
+        "This conversation began with a /clear. alpha's session was in this directory; if that is the conversation "
+        "left, alpha stays with it: claude --resume old. The user can say 'you are alpha' to carry on as alpha here."]
 
 
 def test_tmux_suggestion_on_startup(rig, store):
@@ -934,14 +965,114 @@ def test_bash_comments_preserve_command_boundaries(command, verbs):
 
 
 def test_process_test_listing_failure_tells_known_holder(rig, store):
+    # A /branch whose source's binding records another running process, with the listing failing.
     adapter, run, _ = rig
     start(store)
     bind(store, adapter, pid=20)
     run.rows = {}
-    result = adapter.follow_start(event(store), store)
+    result = adapter.follow_start(event(store, kind='fork'), store)
     assert not result.get('move')
     assert result['text'] == "You may be alpha: this conversation replaced its session in this terminal, but kaiusap couldn't follow it in time. Ask the user."
     assert result['offers'] == [{'handle': 'alpha', 'from': 'claude:old'}]  # so "you are alpha" continues the persona
+
+
+def test_branch_moves_the_handle_to_the_copy(rig, store):
+    adapter, run, _ = rig
+    start(store)
+    bind(store, adapter)
+    run.rows = [{'pid': 10, 'sessionId': 'new'}]
+    item = event(store, kind='fork')
+    result = follow(store, Providers({'claude': adapter}, store), item, deadline=time.monotonic() + 3)
+    assert result['moved'] and result['line']['reason'] == 'copy'
+    assert result['line']['moved_from']['session_key'] == 'claude:old'
+    assert result['texts'] == ['You are alpha; the handle followed this conversation from session old, which it replaced in this terminal.']
+    assert result['shown'] == []
+
+
+def test_branch_moves_the_handle_while_the_listing_still_names_the_original(rig, store):
+    # At a /branch, Claude's listing names the original session until after the start hook.
+    adapter, run, _ = rig
+    start(store)
+    bind(store, adapter)
+    run.rows = [{'pid': 10, 'sessionId': 'old'}]
+    began = time.monotonic()
+    result = follow(store, Providers({'claude': adapter}, store), event(store, kind='fork'), deadline=time.monotonic() + 3)
+    assert result['moved'] and result['line']['reason'] == 'copy'
+    assert time.monotonic() - began < 1
+
+
+def test_branch_renames_the_copy_at_once_over_the_inbox_socket(rig, store):
+    # The start hook's sessionTitle is ignored at a /branch and Claude titles the copy itself, so the copy is
+    # renamed with the inbox `rename` line, as at `iam`.
+    adapter, run, _ = rig
+    start(store)
+    bind(store, adapter)
+    run.rows = [{'pid': 10, 'sessionId': 'new'}]
+    inbox = Inbox()
+    result = follow(store, Providers({'claude': adapter}, store), event(store, kind='fork', socket=inbox.path),
+                    deadline=time.monotonic() + 3)
+    inbox.close()
+    assert result['moved'] and json.loads(inbox.data) == {'type': 'control', 'action': 'rename', 'name': 'alpha',
+                                                          'session_id': 'new'}
+    named = [e for e in store.events() if e['event'] == 'named' and e['kind'] == 'handle']
+    assert named[-1]['name'] == 'alpha' and named[-1]['session_key'] == 'claude:new'
+
+
+@pytest.mark.parametrize('title,applied', [('you are alpha (Branch 4)', True), ('my own name', False)])
+def test_the_first_prompt_after_a_branch_names_the_copy_over_claudes_branch_title(rig, store, title, applied):
+    # Claude titles the copy after the start hook, over the inbox rename; that title isn't the user's rename.
+    adapter, run, _ = rig
+    start(store)
+    bind(store, adapter)
+    run.rows = [{'pid': 10, 'sessionId': 'new'}]
+    inbox = Inbox()
+    follow(store, Providers({'claude': adapter}, store), event(store, kind='fork', socket=inbox.path),
+           deadline=time.monotonic() + 3)
+    inbox.close()
+    prompt = {'provider': 'claude', 'kind': 'prompt', 'session_id': 'new', 'session_key': 'claude:new',
+              'session_title': title, 'hook_event_name': 'UserPromptSubmit'}
+    output = adapter.mirror_output(prompt)
+    assert output.get('hookSpecificOutput', {}).get('sessionTitle') == ('alpha' if applied else None)
+
+
+def test_branch_while_another_process_holds_the_source_is_offered(rig, store):
+    adapter, run, _ = rig
+    start(store)
+    bind(store, adapter, pid=20)
+    run.rows = [{'pid': 20, 'sessionId': 'old'}]
+    result = follow(store, Providers({'claude': adapter}, store), event(store, kind='fork'), deadline=time.monotonic() + 3)
+    assert not result['moved'] and handles(store)['alpha']['session_key'] == 'claude:old'
+    assert result['texts'] == ["This conversation is a copy of alpha's. It has no handle. To carry on as alpha here, the "
+                               "user says 'you are alpha'."]
+    assert result['shown'] == ["kaiusap: this conversation is a copy of alpha's and holds no handle. To carry on as "
+                               "alpha here, say 'you are alpha'."]
+    assert [r['offered'] for r in store.rows('sessions/personas.jsonl') if r.get('offered')] == ['alpha']
+
+
+def test_an_unplaced_copy_is_shown_a_line(rig, store):
+    adapter, _, _ = rig
+    result = follow(store, Providers({'claude': adapter}, store), event(store, kind='fork', pid=20),
+                    deadline=time.monotonic() + 3)
+    assert result['texts'] == [COPY]
+    assert result['shown'] == ['kaiusap: this conversation holds no handle. If it is a copy, the original keeps its handle.']
+    assert adapter.show('x') == {'systemMessage': 'x'}
+
+
+def test_a_clone_is_told_where_the_handle_went_and_offered_it(rig, store):
+    adapter, run, _ = rig
+    start(store)
+    bind(store, adapter)
+    run.rows = [{'pid': 10, 'sessionId': 'new'}]
+    providers = Providers({'claude': adapter}, store)
+    follow(store, providers, event(store, kind='fork'), deadline=time.monotonic() + 3)
+    resumed = {**event(store, 'old', kind='resume', pid=20), 'at': now()}
+    result = follow(store, providers, resumed, deadline=time.monotonic() + 3)
+    assert result['texts'] == [
+        "This conversation is not alpha's current one. alpha went on in session new; what was said there isn't here. "
+        "To carry on as alpha from there: claude --resume new. To continue from here instead, the user says 'you are alpha'."]
+    assert result['shown'][0].startswith("kaiusap: this conversation is not alpha's current one.")
+    assert [(r['session_key'], r['offered'], r['from']) for r in store.rows('sessions/personas.jsonl') if r.get('offered')] == [
+        ('claude:old', 'alpha', 'claude:new')]
 
 
 def test_sessions_shows_both_terminals_and_puts_running_first(rig, store):
@@ -1225,7 +1356,7 @@ def test_iam_retires_a_running_session_named_the_handle_at_once(rig, store):
         start(store, sid='new', pid=20, at='2026-11-01T00:00:05Z')
         run.rows = [{'pid': 10, 'sessionId': 'old', 'name': 'alpha', 'kind': 'interactive', 'cwd': '/fixture'}]
         offer(store, 'claude:new', 'alpha', 'claude:old')  # a live holder's name needs an offer
-        result = claude_core(store, providers, 'new', 20).run('iam', {'handle': 'alpha'})
+        result = confirmed_iam(claude_core(store, providers, 'new', 20), 'alpha')
     finally:
         inbox.close()
     retired = retirement_name('alpha', handles(store)['alpha']['at'])
@@ -1261,7 +1392,9 @@ def test_retirement_waits_for_the_hook_unless_the_listing_shows_the_handles_name
             claude_core(store, providers).run('iam', {'handle': 'beta'})
         else:
             offer(store, 'claude:new', 'alpha', 'claude:old')  # a live holder's name needs an offer
-            claude_core(store, providers, 'new', 20).run('iam', {'handle': 'alpha'})
+            # A holder no listing shows isn't live: the offered iam moves at once.
+            core = claude_core(store, providers, 'new', 20)
+            core.run('iam', {'handle': 'alpha'}) if case == 'not_listed' else confirmed_iam(core, 'alpha')
     finally:
         inbox.close()
     assert not [e for e in store.events() if e['event'] == 'named' and e['kind'] == 'retired']
@@ -1571,7 +1704,7 @@ def test_retirement_renames_before_the_mirror_in_one_call(rig, store, tmux):
         start(store, sid='new', pid=20, at='2026-11-01T00:00:05Z', socket=new_inbox.path, tmux_pane=tmux.key(new_pane))
         run.rows = [{'pid': 10, 'sessionId': 'old', 'name': 'alpha', 'kind': 'interactive'}]
         offer(store, 'claude:new', 'alpha', 'claude:old')  # a live holder's name needs an offer
-        result = claude_core(store, providers, 'new', 20).run('iam', {'handle': 'alpha'})
+        result = confirmed_iam(claude_core(store, providers, 'new', 20), 'alpha')
     finally:
         old_inbox.close()
         new_inbox.close()
@@ -1732,6 +1865,14 @@ def test_attach_line_names_the_tmux_session_exactly(name):
     assert shlex.split(line) == ["tmux", "-L", "default", "attach", "-t", "=" + name]
 
 
+def confirmed_iam(core, handle):
+    """An offered `iam` while the holder's session runs: refused once for the user's confirmation, then taken."""
+    with pytest.raises(Error) as refused:
+        core.run('iam', {'handle': handle})
+    assert refused.value.reason_code == 'confirmation_needed' and refused.value.code == 1
+    return core.run('iam', {'handle': handle, 'confirmed': True})
+
+
 def offer(store, key, handle, holder):
     """The start hook's offer of `handle` to session `key`, so `iam` may take it from a live holder."""
     from kaiusap.model import PERSONAS
@@ -1739,17 +1880,13 @@ def offer(store, key, handle, holder):
     store.append(PERSONAS, {"at": now(), "session_key": key, "offered": handle, "from": holder})
 
 
-def test_a_clear_with_no_handle_still_continues_the_persona(rig, store):
-    # A /clear in a session holding no handle is still the persona; the session this
-    # process held just before is recorded as continued, unless another process holds it now.
+def test_a_clear_in_a_session_with_no_handle_says_nothing_and_writes_no_persona_line(rig, store):
     adapter, run, _ = rig
     start(store)
     run.rows = [{'pid': 10, 'sessionId': 'new'}]
-    proposal = adapter.follow_start(event(store), store)
-    assert proposal['persona'] == {'continues': 'claude:old', 'via': 'fresh-start'} and not proposal.get('move')
-    adapter.reset()
-    run.rows = [{'pid': 10, 'sessionId': 'new'}, {'pid': 30, 'sessionId': 'old'}]  # resumed elsewhere meanwhile
-    assert 'persona' not in adapter.follow_start(event(store, sid='newer'), store)
+    result = follow(store, Providers({'claude': adapter}, store), event(store), deadline=time.monotonic() + 3)
+    assert result['texts'] == [] and result['shown'] == [] and not result['moved']
+    assert not [r for r in store.rows('sessions/personas.jsonl') if r.get('continues')]
 
 
 def test_harness_version_is_the_running_version_from_the_newest_transcript_line(store, tmp_path):

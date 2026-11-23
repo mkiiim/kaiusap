@@ -47,6 +47,9 @@ REASONS = {
 PS = re.compile(r"^\s*(\w{3}\s+\w{3}\s+\d+\s+\d\d:\d\d:\d\d\s+\d{4})\s+(.*)$")
 PANE_FORMAT = "\t".join(["#{pane_id}", "#{session_name}", "#{session_attached}", "#{pid}", "#{start_time}"])
 COPY = "This conversation has no handle; if it is a copy of another one, the original keeps its handle."
+# The title Claude gives a /branch copy, after the start hook (seen on 2.1.330: "<title> (Branch 4)"). It isn't a
+# name the user typed.
+BRANCH_TITLE = re.compile(r".* \(Branch \d+\)")
 # `setup`: its two items, at their places in setup's order.
 SETUP_PLUGIN, SETUP_VERSION = 1, 5
 MIN_CLAUDE = (2, 1, 224)
@@ -137,6 +140,8 @@ class ClaudeAdapter:
     prompt_events = frozenset({"UserPromptSubmit"})
     screen_events = frozenset({"PreToolUse"})  # the spawned-agent tool-call screen
     setup_flags = frozenset()
+    session_noun = "session"
+    shown_stays = True  # a start hook's systemMessage stays in the scrollback
 
     @classmethod
     def claims(cls, environment):
@@ -744,6 +749,39 @@ class ClaudeAdapter:
     def tell(self, text, event="UserPromptSubmit"):
         return {"hookSpecificOutput": {"hookEventName": event, "additionalContext": text}}
 
+    def show(self, text, event="UserPromptSubmit"):
+        """A line for the user: the hook's `systemMessage`, which Claude Code shows as "<hook>:<source> says: <text>"."""
+        return {"systemMessage": text}
+
+    def resume_command(self, session_key, cwd):
+        from ..model import last_directory
+        import shlex
+        sid = session_key.split(":", 1)[1]
+        command = "claude --resume " + shlex.quote(sid)
+        directory = last_directory(self.store, session_key)
+        if directory and cwd and os.path.normpath(directory) != os.path.normpath(cwd):
+            command = f"cd {shlex.quote(directory)} && {command}"
+        return command
+
+    def name_fresh(self, event, handle, name):
+        """At a /clear the start hook's `sessionTitle` is ignored, so the new session is renamed with the inbox
+        `rename` line, when its name is empty or the handle's (a /clear carries the name over). A line not written
+        is tried again at the next prompt hook, by its `sessionTitle`."""
+        title = event.get("session_title")
+        if title not in (None, "", handle):
+            return []
+        applied = bool(event.get("socket")) and self.rename(event["socket"], event["session_id"], name)
+        self.fresh_named(event, handle, name, applied)
+        if not applied:
+            return []
+        return self.follow_session_name(event.get("tmux_pane"), name, event.get("pid"))
+
+    def fresh_named(self, event, handle, name, applied, retry=False):
+        """The `named` event of a fresh session's name: `name` when applied, else None with the name still `wanted`."""
+        self.store.event("named", handle=handle, session_id=event["session_id"], session_key=event["session_key"],
+                         binding=None, name=name if applied else None, wanted=name, kind="fresh", retry=retry,
+                         by_session=event["session_id"], by_session_key=event["session_key"], deadline=event.get("deadline"))
+
     def binding_record(self, session_id, pid, started):
         """The latest start record of the process (pid and start time) for the session, or None."""
         if not pid or not started:
@@ -753,11 +791,13 @@ class ClaudeAdapter:
             r.get("pid") == pid and r.get("process_started_at") == started, started)
 
     def mirror(self, binding):
-        """At `iam`, rename the session at once with the inbox `rename` line, to the socket in the binding's start
+        """At `iam` and a `copy` move, rename the session at once with the inbox `rename` line, to the socket in the binding's start
         record; a line written in full is the `named` event, so the hooks don't apply it again. Then
         the tmux session rename for the name just applied and the window name for the record's pane. A line not written leaves the name to the
-        hooks. Hook moves are named by the hooks' `sessionTitle` (mirror_output), so they do nothing here."""
-        if binding.get("reason") != "iam" or not binding.get("session_key"):
+        hooks. Other hook moves are named by the hooks' `sessionTitle` (mirror_output), so they do nothing here."""
+        # A copy the user was moved into is renamed the same way: at a /branch the start hook's `sessionTitle` is
+        # ignored, as at a /clear, and Claude gives the copy a title of its own.
+        if binding.get("reason") not in {"iam", "copy"} or not binding.get("session_key"):
             return []
         warnings = []
         try:
@@ -1016,6 +1056,7 @@ class ClaudeAdapter:
     def marker_fields(self, state, event):
         """The marker's Claude fields, read back by `claude.rs`'s `clean`: the title rule
         for the next prompt, and the fingerprint of the transcript index this hook verified."""
+        from ..model import fresh_pending
         title_mode, title = "any", None
         events, binding = state.data["events"], state.binding
         if binding:
@@ -1027,6 +1068,8 @@ class ClaudeAdapter:
         retired = {e.get("binding") for e in events if e.get("event") == "named" and e.get("kind") == "retired"}
         if any(b["id"] not in retired for b, _ in state.data["ended"]):
             title_mode = "work"
+        if not binding and fresh_pending(events, state.key):
+            title_mode = "work"  # a fresh session's name still to set
         index_signature = None
         try:
             st = self.index_path(event["session_id"]).stat()
@@ -1041,7 +1084,7 @@ class ClaudeAdapter:
     def mirror_output(self, event):
         """Record the title decision before returning output; the only call it makes is the tmux session
         rename for the name it applies, or at start for a current name equal to the handle's."""
-        from ..model import binding_history, held, retirement_name
+        from ..model import binding_history, fresh_pending, held, retirement_name
         if event.get("identity") and event["identity"].agent_id:
             return {}
         if event.get("kind") not in {"startup", "resume", "fork", "prompt"}:
@@ -1060,7 +1103,8 @@ class ClaudeAdapter:
                 output = handle if allowed else None
                 self.named(binding, output, "handle", event)
             elif event["kind"] == "prompt" and not any(e.get("retry") for e in named):
-                if title is None and not any(e.get("name") is None for e in named):
+                if (title is None or (binding["reason"] == "copy" and BRANCH_TITLE.fullmatch(title))) and \
+                        not any(e.get("name") is None for e in named):
                     output = handle
                     self.named(binding, output, "handle", event, retry=True)
                 elif title is not None and title != handle:
@@ -1079,6 +1123,11 @@ class ClaudeAdapter:
             self.named(binding, name, "retired", event)
             if name:
                 output = name
+        pending = None if handle else fresh_pending(retirement_events if event.get("naming_events") is not None else
+                                                    self.store.events(), key)
+        if pending and output is None and event["kind"] == "prompt" and title in (None, "", pending["handle"]):
+            output = pending["wanted"]
+            self.fresh_named(event, pending["handle"], output, True, retry=True)
         if output is None and event["kind"] in {"startup", "resume"} and handle and title == handle:
             follow = handle  # at start: the current name is the handle's
         else:
@@ -1146,8 +1195,21 @@ class ClaudeAdapter:
             if held(bindings, key):
                 return {"suggest": False}
             previous = self.previous(event)
+            if previous:
+                # A copy in the process that showed the session just before (a /branch): the user is moved into it.
+                name = held(bindings, previous[0]["session_key"])
+                if not name:
+                    return {"text": COPY, "suggest": False, "unplaced": True}
+                binding = bindings[name]
+                other = self.held_by_other(binding, event)
+                if other == "failed":
+                    failed = self.propose(event, binding, "copy")["failed"]
+                    return {"text": failed, "suggest": False, "offers": [{"handle": name, "from": binding["session_key"]}]}
+                if other:
+                    return {"suggest": False, "copy_of": {"handle": name, "from": binding["session_key"]}}
+                return self.propose(event, binding, "copy")
             holders = [b for b in bindings.values() if b and b["provider"] == "claude"]
-            if not previous and holders:
+            if holders:
                 end = min(event.get("entered", self.clock()) + 1.5, self._deadline or float("inf"))
                 while True:
                     for binding in holders:
@@ -1173,40 +1235,16 @@ class ClaudeAdapter:
                                 "is one of them continuing in the background.")
                     return {"text": text,
                             "offers": [{"handle": b["handle"], "from": b["session_key"]} for b in late], "suggest": False}
-            return {"text": COPY, "suggest": False}
+            return {"text": COPY, "suggest": False, "unplaced": True}
         if event["kind"] == "clear":
+            # The handle stays with the session left; the new one is told, named and offered it. A session left
+            # that holds no handle: nothing is said.
             earlier = self.previous(event)
-            via = []
-            next_record = event
-            for row in earlier:
-                name = held(bindings, row["session_key"])
+            if earlier:
+                name = held(bindings, earlier[0]["session_key"])
                 if name:
-                    binding = bindings[name]
-                    # Another live receiving terminal keeps the handle.
-                    if binding.get("pid") and (binding["pid"], binding.get("process_started_at")) != (event.get("pid"), event.get("process_started_at")):
-                        process = self.process(binding["pid"])
-                        if process and process[0] == binding.get("process_started_at"):
-                            listing = self.listing()
-                            if listing is False:
-                                store.log("Claude process test: listing_failed")
-                                failed = self.propose(event, binding, "fresh-start", via)["failed"]
-                                # Offered, so "you are <handle>" continues the persona, as when a move fails.
-                                return {**proposal, "text": failed, "suggest": False, "told": True,
-                                        "offers": [{"handle": binding["handle"], "from": binding["session_key"]}]}
-                            rows = [r for r in listing if r.get("pid") == binding["pid"]]
-                            latest = self.latest_process(binding["pid"], process[0])
-                            if any(r.get("sessionId") == binding["session_id"] for r in rows) or (
-                                not rows and latest and latest.get("teammate") and latest["session_key"] == binding["session_key"]):
-                                return {**proposal, "suggest": False}
-                    return {**proposal, **self.propose(event, binding, "fresh-start", via)}
-                if row["source"] != "clear" or (instant(next_record["at"]) - instant(row["at"])).total_seconds() > 3:
-                    break
-                via.append(row["session_key"])
-                next_record = row
-            # No handle followed, but the /clear still continues the persona of the session
-            # this process held just before, when no other process holds that session now.
-            if earlier and not self.held_elsewhere(earlier[0]["session_id"], event.get("pid")):
-                return {**proposal, "persona": {"continues": earlier[0]["session_key"], "via": "fresh-start"}}
+                    return {**proposal, "suggest": False, "fresh": {"handle": name, "from": earlier[0]["session_key"]}}
+                return {**proposal, "suggest": False}
         if event["kind"] == "resume":
             candidates = []
             for binding in store.rows("handles.jsonl"):
@@ -1219,6 +1257,24 @@ class ClaudeAdapter:
                 binding = bindings[max(candidates, key=lambda b: b["at"])["handle"]]
                 return {**proposal, **self.propose(event, binding, "rewind")}
         return proposal
+
+    def held_by_other(self, binding, event):
+        """The process test: whether the handle's binding records another process, still running by pid and start
+        time, that still holds the binding's session (by the listing, or for an unlisted teammate by its latest
+        start record). "failed" when the listing can't be read."""
+        if not binding.get("pid") or (binding["pid"], binding.get("process_started_at")) == (event.get("pid"), event.get("process_started_at")):
+            return False
+        process = self.process(binding["pid"])
+        if not process or process[0] != binding.get("process_started_at"):
+            return False
+        listing = self.listing()
+        if listing is False:
+            self.store.log("Claude process test: listing_failed")
+            return "failed"
+        rows = [r for r in listing if r.get("pid") == binding["pid"]]
+        latest = self.latest_process(binding["pid"], process[0])
+        return any(r.get("sessionId") == binding["session_id"] for r in rows) or bool(
+            not rows and latest and latest.get("teammate") and latest["session_key"] == binding["session_key"])
 
     def held_elsewhere(self, session_id, pid):
         """Whether the listing shows another process holding the session; a failed listing counts as yes."""
@@ -1282,6 +1338,9 @@ class ClaudeAdapter:
         if reason == "moved-background":
             text = f"You are {handle}; the handle followed this conversation from session {sid}."
             failed = f"You may be {handle}: this conversation continued its session in the background, but kaiusap couldn't follow it in time. Ask the user."
+        elif reason == "copy":
+            text = f"You are {handle}; the handle followed this conversation from session {sid}, which it replaced in this terminal."
+            failed = f"You may be {handle}: this conversation replaced its session in this terminal, but kaiusap couldn't follow it in time. Ask the user."
         elif reason == "rewind":
             text = f"You are {handle}; the handle came back from session {sid}, which this conversation replaced."
             failed = f"You may be {handle}: this conversation is the one before a /clear in this terminal, but kaiusap couldn't move the handle back in time. Ask the user."
@@ -1300,6 +1359,11 @@ class ClaudeAdapter:
         latest = max(r["at"] for r in records)
         if event["at"] != latest or sum(r["at"] == latest for r in records) != 1:
             return False
+        if (proposal.get("move") or {}).get("reason") == "copy":
+            # A /branch's start hook runs before Claude's listing names the copy (seen on 2.1.330: it still named the
+            # original for the whole hook), so the listing can't say which session the process shows; that this start
+            # is the process's newest is the whole test.
+            return True
         first = True
         while True:
             listing = self.listing(refresh=True)
@@ -1324,3 +1388,4 @@ class ClaudeAdapter:
                 self.store.log("Claude start currency: listing still names another session")
                 return False
             self.sleep(wait)
+
