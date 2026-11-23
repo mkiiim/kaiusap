@@ -55,6 +55,16 @@ class HookBudget:
             self.output.setdefault('hookSpecificOutput', {}).update(adapter.tell(text, name)['hookSpecificOutput'])
 
 
+def merge(output, fragment):
+    """Add a hook output fragment to an output: its objects merged one level deep, anything else set."""
+    for key, value in (fragment or {}).items():
+        if isinstance(value, dict) and isinstance(output.get(key), dict):
+            output[key].update(value)
+        else:
+            output[key] = value
+    return output
+
+
 def unread_note(store, state, event, deadline):
     from .notice import notice
     # The persona's unread mail, with a handle or without; each message is mentioned once per session.
@@ -114,7 +124,7 @@ def dispatch(provider, name, payload, deadline, budget=None):
     event = adapter.events(payload, deadline=deadline)
     if not event:
         return None
-    texts, output = [], {}
+    texts, output, shown = [], {}, {}
     if start and event.get('kind') == 'subagent':
         # A spawned agent's start made by the start hook (a provider whose child sessions get one): the record
         # only, with nothing said and nothing followed, as a record-only event.
@@ -156,11 +166,15 @@ def dispatch(provider, name, payload, deadline, budget=None):
                 budget.check()
             result = follow(store, providers, event, deadline)
             texts.extend(result['texts'])
+            if result.get('shown'):
+                # The line for the user, shown by the provider's own means rather than through the assistant.
+                shown = adapter.show('\n'.join(result['shown']), name)
             if budget:
                 # Following is done and its texts describe work done: they are committed. A name
                 # mirrored while following commits nothing further.
                 budget.finishing = False
                 budget.context(adapter, '\n'.join(texts), name)
+                merge(budget.output, shown)
             # follow() closes its adapter. Restore the one total deadline.
             for item in providers.adapters.values():
                 item._deadline = item.hook_deadline(deadline)
@@ -188,6 +202,7 @@ def dispatch(provider, name, payload, deadline, budget=None):
                 texts.append(text)
         if texts:
             output.setdefault('hookSpecificOutput', {}).update(adapter.tell('\n'.join(texts), name)['hookSpecificOutput'])
+        merge(output, shown)
         if budget:
             budget.check()
         state.save(event, adapter.marker_fields(state, event))

@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 import fcntl
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -277,11 +278,13 @@ SOURCES = ['startup', 'resume', 'clear', 'compact', 'fork']
 @pytest.mark.parametrize('source', SOURCES)
 def test_start_gives_the_session_line_alone(store, monkeypatch, native, fakes, provider, source):
     """Every start hook, on every source, adds the session line; with nothing else to say, it is
-    all. A fork is always told it is a copy, so there the line comes first."""
+    all. A fork is always told it is a copy, so there the line comes first; a Claude copy kaiusap can't place
+    also shows the user a line."""
     monkeypatch.setenv('KAIUSAP_HOME', str(store.root))
     data = payload(provider); data['source'] = source
     out = invoke(native, provider, 'SessionStart', data)
-    assert out['hookSpecificOutput']['hookEventName'] == 'SessionStart' and set(out) == {'hookSpecificOutput'}
+    shown = {'systemMessage'} if (provider, source) == ('claude', 'fork') else set()
+    assert out['hookSpecificOutput']['hookEventName'] == 'SessionStart' and set(out) == {'hookSpecificOutput'} | shown
     lines = context(out).split('\n')
     assert lines == [SESSION_LINE] if source != 'fork' else (lines[0] == SESSION_LINE and len(lines) == 2)
     assert list(store.rows('sessions/starts.jsonl'))[-1]['source'] == source
@@ -458,10 +461,14 @@ def test_claude_clear_wires_follow_and_defers_name(store, monkeypatch, fakes):
     bind(store,'claude',sid='old')
     new = payload('claude'); new['source']='clear'
     out = direct('claude','SessionStart',new)
-    assert 'You are alpha; the handle followed' in context(out)
-    assert handles(store)['alpha']['session_key'] == 'claude:'+ROOT
+    # The handle stays with the session left; the new one is told, shown a line, and renamed by the inbox line.
+    assert 'This is a new conversation. It is not alpha' in context(out)
+    assert out['systemMessage'].startswith('kaiusap: new conversation. alpha stays with the one you left')
+    assert handles(store)['alpha']['session_key'] == 'claude:old'
     assert 'sessionTitle' not in out.get('hookSpecificOutput',{})
-    assert direct('claude','UserPromptSubmit',new)['hookSpecificOutput']['sessionTitle'] == 'alpha'
+    fresh = [e for e in store.events() if e['event'] == 'named' and e['kind'] == 'fresh']
+    assert len(fresh) == 1 and re.fullmatch(r'alpha~\d{12}', fresh[0]['name'] or '')
+    assert 'sessionTitle' not in direct('claude','UserPromptSubmit',new).get('hookSpecificOutput', {})
 
 
 def test_claude_cwd_index_and_native_title_retry(store, monkeypatch, native, fakes):
@@ -606,7 +613,7 @@ def test_retirement_deferred_at_clear_is_still_work(store):
     old=bind(store,'claude')
     bind(store,'claude',sid='destination')
     state=HookState(store,'claude',ROOT)
-    event=dict(provider='claude',session_id=ROOT,transcript=None,kind='clear')
+    event=dict(provider='claude',session_id=ROOT,session_key='claude:'+ROOT,transcript=None,kind='clear')
     state.save(event, ClaudeAdapter(store).marker_fields(state, event))
     assert any(b['id']==old['id'] for b,_ in state.data['ended'])
     assert json.loads(state.marker.read_text())['title_mode']=='work'

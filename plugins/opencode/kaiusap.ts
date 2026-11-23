@@ -2,7 +2,8 @@
 //
 // It holds no rule of kaiusap's. For each event in HOOK_EVENTS it runs `kaiusap hook opencode <event>` with
 // the hook input on stdin and carries out the output in OpenCode's terms: `tell` becomes a text part the
-// model reads, `title` a session.update, `deny` an error thrown from tool.execute.before. Besides the hooks
+// model reads, `title` a session.update, `toast` a toast in the TUI the user sees, `deny` an error thrown from
+// tool.execute.before. Besides the hooks
 // it reports facts only this process can see, serves the delivery socket, and writes the calling session's
 // id into every kaiusap MCP call as `_kaiusap_session`. It adds no tools.
 import { createHash } from "node:crypto"
@@ -31,7 +32,9 @@ const LIMIT_MS: Record<string, number> = { "session.start": 3500, "chat.message"
 const MAX_LINE = 1 << 20
 
 type Info = { parentID?: string | null; title?: string | null }
-type Output = { tell?: string; title?: string; deny?: string }
+type Output = { tell?: string; title?: string; toast?: string; deny?: string }
+// How long a toast for the user stays.
+const TOAST_MS = 15000
 
 // The plugin's own failures go where the hooks' do, since OpenCode shows a plugin's errors nowhere.
 function logError(reason: string) {
@@ -178,6 +181,11 @@ export const KaiusapPlugin = async ({ client, directory, serverUrl }: any) => {
         id: `${template.id ?? "prt_kaiusap"}k${parts.length}`, sessionID: template.sessionID ?? id,
         messageID: template.messageID, type: "text", text: told.join("\n"), synthetic: true,
       })
+    }
+    for (const message of outputs.map((o) => o.toast).filter((t): t is string => typeof t === "string" && t.length > 0)) {
+      try {
+        await client.tui.showToast({ body: { message, variant: "info", duration: TOAST_MS } })
+      } catch {}
     }
     const named = outputs.map((o) => o.title).filter((t): t is string => typeof t === "string" && t.length > 0).pop()
     if (named) {

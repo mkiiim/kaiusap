@@ -7,6 +7,7 @@ import pytest
 from conftest import send
 from kaiusap.core import Core
 from kaiusap.errors import Error
+from kaiusap.model import handles
 
 
 def test_a_persona_that_takes_another_name_answers_its_earlier_mail_under_it(pair, store):
@@ -134,9 +135,40 @@ def test_an_offer_lets_you_are_continue_the_persona_with_its_mail(pair, store):
     mid = send(a)['message_id']
     offer(store, 'codex:c', 'beta', 'codex:b')
     c = other(store, LiveProvider(b.provider))
-    result = c.run('iam', {'handle': 'beta'})  # b is live, but c was offered beta
+    result = c.run('iam', {'handle': 'beta', 'confirmed': True})  # b is live, c was offered beta, the user confirmed
     assert result['continued'] is True and result['notice'] is None
     assert [m['id'] for m in c.run('inbox', {})['messages']] == [mid]  # the mail came with it
+
+
+def test_an_offer_from_a_live_session_asks_the_user_to_confirm_first(pair, store):
+    from kaiusap.model import PERSONAS
+    a, b = pair
+    offer(store, 'codex:c', 'beta', 'codex:b')
+    lines, personas = len(list(store.rows("handles.jsonl"))), len(list(store.rows(PERSONAS)))
+    c = other(store, LiveProvider(b.provider))
+    with pytest.raises(Error) as asked:
+        c.run('iam', {'handle': 'beta'})
+    assert (asked.value.code, asked.value.reason_code) == (1, "confirmation_needed")
+    assert str(asked.value) == ("beta is held by a running Codex session in an unknown directory. Ask the user to "
+                                "confirm that beta should move here, with its mail and its earlier handles; if they "
+                                "do, run iam again with --confirmed.")
+    # Nothing is written between the two calls.
+    assert len(list(store.rows("handles.jsonl"))) == lines
+    assert len([r for r in store.rows(PERSONAS) if not r.get("suggested")]) == personas
+    assert handles(store)['beta']['session_key'] == 'codex:b'
+
+
+def test_confirmed_without_an_offer_is_still_refused(pair, store):
+    a, b = pair
+    with pytest.raises(Error, match='is in use by a running'):
+        other(store, LiveProvider(b.provider)).run('iam', {'handle': 'beta', 'confirmed': True})
+
+
+def test_an_offer_from_a_stopped_session_moves_at_once(pair, store):
+    a, b = pair
+    offer(store, 'codex:c', 'beta', 'codex:b')
+    result = other(store, b.provider).run('iam', {'handle': 'beta'})  # FakeProvider: b isn't live
+    assert result['continued'] is True
 
 
 def test_an_offer_closes_when_the_handle_moves_or_the_session_starts_again(pair, store):
@@ -187,12 +219,14 @@ def test_the_clear_suggestion_is_recorded_as_an_offer(pair, store):
     providers = Providers({'codex': b.provider}, store)
     event = {"provider": "codex", "kind": "clear", "session_id": "c", "session_key": "codex:c", "cwd": "/w"}
     text = suggest(store, providers, event, {})
-    assert text.startswith("You may be `beta`: this conversation began with a /clear kaiusap couldn't follow")
+    assert text == ("This conversation began with a /clear. beta's session was in this directory; if that is the "
+                    "conversation left, beta stays with it: resume it from its provider's session list. The user can "
+                    "say 'you are beta' to carry on as beta here.")
     assert [(r["session_key"], r["offered"], r["from"]) for r in store.rows(PERSONAS)] == [("codex:c", "beta", "codex:b")]
 
 
-def test_a_clear_that_continued_a_persona_gets_no_offer(pair, store):
-    # kaiusap followed this /clear (a persona line), so it isn't offered another persona's handle.
+def test_a_clear_whose_session_left_was_found_gets_no_suggestion(pair, store):
+    # The adapter found the session left (it held no handle), so nothing is said and nothing is offered.
     from kaiusap.adapters import Providers
     from kaiusap.following import suggest
     from kaiusap.model import PERSONAS
@@ -201,8 +235,7 @@ def test_a_clear_that_continued_a_persona_gets_no_offer(pair, store):
     store.append("sessions/starts.jsonl", {"at": now(), "provider": "codex", "session_id": "b", "session_key": "codex:b",
                                            "source": "startup", "cwd": "/w"})
     event = {"provider": "codex", "kind": "clear", "session_id": "c", "session_key": "codex:c", "cwd": "/w"}
-    proposal = {"persona": {"continues": "codex:x", "via": "fresh-start"}}
-    assert suggest(store, Providers({'codex': b.provider}, store), event, proposal) is None
+    assert suggest(store, Providers({'codex': b.provider}, store), event, {"suggest": False}) is None
     assert not [r for r in store.rows(PERSONAS) if r.get("offered")]
 
 

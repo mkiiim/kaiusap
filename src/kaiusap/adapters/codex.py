@@ -15,7 +15,7 @@ from . import SPAWNED_AGENT_TEXT, UNIDENTIFIED_CLOSE, Identity, context_use, tai
 from .daemon import Daemon, DaemonError, Deadline, RpcError, TURN_LIMIT, find_daemon, linux_start_time, run_command, time_locale_env
 from ..errors import Error
 from ..storeformat import NewerFormat
-from ..model import binding_history, handles, held, instant, last_directory, load_settings, retirement_name
+from ..model import binding_history, fresh_pending, handles, held, instant, last_directory, load_settings, retirement_name
 from ..notice import notice, notice_id
 from ..store import decoded, identifier, now
 
@@ -197,6 +197,8 @@ class Pane:
 class CodexAdapter:
     delivers = True
     harness_maker = "openai"  # `sessions`
+    session_noun = "thread"
+    shown_stays = True  # a hook's systemMessage is a line in the thread's history
     provider = "codex"
     session_variable = "CODEX_THREAD_ID"
     hook_events = frozenset({"SessionStart", "UserPromptSubmit", "SubagentStart"})
@@ -526,6 +528,45 @@ class CodexAdapter:
 
     def tell(self, text, event="UserPromptSubmit"):
         return {"hookSpecificOutput": {"hookEventName": event, "additionalContext": text}}
+
+    def show(self, text, event="UserPromptSubmit"):
+        """A line for the user: the hook's `systemMessage`, shown in the thread's history."""
+        return {"systemMessage": text}
+
+    def resume_command(self, session_key, cwd):
+        import shlex
+        thread = self.thread_of(session_key)
+        command = f"codex resume {shlex.quote(thread)}"
+        directory = last_directory(self.store, session_key)
+        if directory and not self.same_directory(directory, cwd):
+            command = f"cd {shlex.quote(directory)} && {command}"
+        return command
+
+    def name_fresh(self, event, handle, name):
+        """Name a fresh start's new thread with `thread/name/set` when it has no name, or the handle's. With no
+        daemon, the name waits for the call's catch-up."""
+        thread = event["session_id"]
+        try:
+            current = self.thread(thread).get("name")
+            if current not in (None, "", handle):
+                return []
+            self.daemon().set_name(thread, name)
+        except DaemonError as exc:
+            self.fresh_named(event["session_key"], handle, name, False)
+            return [f"The Codex thread wasn't renamed {name} ({REASONS[exc.code]}); it will be at the next kaiusap call that reaches the daemon."]
+        except RpcError as exc:
+            self.store.log(f"thread/name/set for {thread} failed: {exc.message}")
+            return []
+        self.fresh_named(event["session_key"], handle, name, True)
+        return self.follow_session_name(thread, name)
+
+    def fresh_named(self, key, handle, name, applied, retry=False):
+        try:
+            self.store.event("named", handle=handle, session_id=self.thread_of(key), session_key=key, binding=None,
+                             name=name if applied else None, wanted=name, kind="fresh", retry=retry,
+                             by_session=self.thread_of(key), by_session_key=key, deadline=self.deadline().at)
+        except OSError as exc:
+            self.store.warn(exc)
 
     def hook_output(self, event, state):
         """Codex sets no name through a hook (it uses `thread/name/set`, at once), so a hook adds nothing of its own."""
@@ -1228,6 +1269,26 @@ class CodexAdapter:
                 return
             if binding and binding["provider"] == "codex" and (binding["id"], "handle") not in done:
                 self.store.warnings.extend(self._mirror(binding))
+        # A fresh thread's name that found no daemon at its start, once.
+        try:
+            events = [e for e in self.store.events() if e.get("event") == "named" and e.get("kind") == "fresh"]
+        except OSError as exc:
+            self.store.warn(exc)
+            return
+        for key in dict.fromkeys(e.get("session_key") for e in events if str(e.get("session_key")).startswith("codex:")):
+            pending = fresh_pending(events, key)
+            if not pending or held(current, key) or self.deadline().expired():
+                continue
+            thread = self.thread_of(key)
+            try:
+                if self.thread(thread).get("name") in (None, "", pending["handle"]):
+                    self.daemon().set_name(thread, pending["wanted"])
+                    self.fresh_named(key, pending["handle"], pending["wanted"], True, retry=True)
+                    self.store.warnings.extend(self.follow_session_name(thread, pending["wanted"]))
+                    continue
+            except (DaemonError, RpcError) as exc:
+                self.store.log(f"thread/name/set for {thread} failed: {exc}")
+            self.fresh_named(key, pending["handle"], pending["wanted"], False, retry=True)
 
     # ----- follow a start: Codex steps 1–4 ---------------------------
 
@@ -1283,13 +1344,37 @@ class CodexAdapter:
         if not directory:
             return ask
         if self.same_directory(directory, event.get("cwd")):
-            return {"text": f"This conversation is a copy of the one holding {holder}, which keeps it; you have no handle.", "suggest": False}
+            # A pane that showed the parent in its current Codex process now shows the copy: the user is moved into it.
+            try:
+                pane = self.moved_into(thread, parent)
+            except (DaemonError, RpcError) as exc:
+                self.store.log(f"start {key}: copy not placed: {type(exc).__name__}: {exc}")
+                pane = None
+            if pane:
+                return {"pane": pane.key, "suggest": False,
+                        "move": {"handle": holder, "from": f"codex:{parent}", "to": key, "reason": "copy", "via": None},
+                        "text": f"You are {holder}; the handle followed this conversation from thread {parent}, which it replaced in this terminal.",
+                        "failed": f"You may be {holder}: this conversation replaced its thread in this terminal, but kaiusap couldn't follow it in time. Ask the user."}
+            return {"suggest": False, "copy_of": {"handle": holder, "from": f"codex:{parent}"}}
         # Codex reports /cd, a continued worktree and /fork into a worktree alike, and a clone never
         # takes the handle, so nothing moves into another directory: the session is asked, and that is an offer.
         return {"text": f"You may be {holder}: this conversation started from {holder}'s thread {parent}, in another "
                         f"directory. Ask the user whether this is {holder} moving here (/cd, or continuing in a worktree) "
                         "or a copy (/fork).",
                 "offers": [{"handle": holder, "from": f"codex:{parent}"}], "suggest": False}
+
+    def moved_into(self, thread, parent):
+        """The pane that showed `parent` last in its current Codex process before it showed `thread`, or None."""
+        panes = self.panes_showing(thread)
+        self.observe(self.panes())
+        for pane in panes:
+            process = self.process_of(pane)
+            if not process:
+                continue
+            previous = next((l for l in self.pane_lines(pane, process) if not self.line_names(l, thread)), None)
+            if previous and self.line_thread(previous) == parent:
+                return pane
+        return None
 
     @staticmethod
     def same_directory(a, b):
@@ -1315,13 +1400,11 @@ class CodexAdapter:
                     found.append((pane, *self.walk_back(bindings, thread, process, lines, previous)))
         except (DaemonError, RpcError) as exc:
             return self.not_followed(key, exc)
-        result = {"suggest": True, "tmux_session": panes[0].session if panes else None}
+        # A thread left that kaiusap found says what it found, or nothing; only one it couldn't find is suggested for.
+        result = {"suggest": not found, "tmux_session": panes[0].session if panes else None}
         holders = list(dict.fromkeys(holder for _, holder, _, _ in found if holder))
         if not holders:
-            # No pane resolves to a holder: no move, nothing told. The thread this pane showed just before still
-            # continues its persona, when no other trusted pane shows that thread.
-            persona = self.continued_without_handle(panes, thread)
-            return {**result, "persona": persona} if persona else result
+            return result
         if len(holders) > 1 or any(not holder for _, holder, _, _ in found):
             # The panes disagree: the holders found are named, and none moves.
             text = (f"You may be {holders[0]}: this terminal showed it before this conversation, so kaiusap didn't move it. "
@@ -1329,45 +1412,9 @@ class CodexAdapter:
                     f"You may be {' or '.join(holders)}: this terminal showed each before this conversation, so kaiusap "
                     "moved neither. Tell the user.")
             return {**result, "suggest": False, "told": True, "text": text}
-        pane, holder, predecessor, via = found[0]
-        directory = last_directory(self.store, f"codex:{predecessor}")
-        if not directory:
-            try:
-                directory = self.thread(predecessor).get("cwd")
-            except (DaemonError, RpcError):
-                directory = None
-        if not directory:
-            return {**result, "suggest": False, "told": True,
-                    "text": f"You may be {holder}: this conversation replaced its thread in this terminal, but kaiusap couldn't find that thread's directory. Tell the user."}
-        if not self.same_directory(directory, event.get("cwd")):
-            # The handle stays in its directory, and the thread is told so; no suggestion.
-            return {**result, "suggest": False, "told": True,
-                    "text": f"This terminal showed {holder} before, in {directory}. This conversation started in "
-                            f"{event.get('cwd')}, so kaiusap left the handle there. Tell the user."}
-        return {**result, "pane": pane.key, "suggest": False,
-                "move": {"handle": holder, "from": f"codex:{predecessor}", "to": key, "reason": "fresh-start", "via": via or None},
-                "text": f"You are {holder}; the handle followed this conversation from thread {predecessor}, which it replaced in this terminal.",
-                "failed": f"You may be {holder}: this conversation replaced its thread in this terminal, but kaiusap couldn't follow it in time. Ask the user."}
-
-    def continued_without_handle(self, panes, thread):
-        """The persona line for a /clear or /new no handle followed: the one pane's previous thread, if no
-        other trusted pane shows it now. None when the panes don't agree on one predecessor."""
-        before = set()
-        for pane in panes:
-            process = self.process_of(pane)
-            if not process:
-                continue
-            previous = next((l for l in self.pane_lines(pane, process) if not self.line_names(l, thread)), None)
-            predecessor = self.line_thread(previous) if previous else None
-            if predecessor:
-                before.add((pane.key, predecessor))
-        if len({p for _, p in before}) != 1:
-            return None
-        predecessor = next(iter(before))[1]
-        shown = {key for key, _ in before}
-        if any(p.key not in shown and p.shows(predecessor) and self.trusted(p, predecessor) for p in self.panes()):
-            return None
-        return {"continues": f"codex:{predecessor}", "via": "fresh-start"}
+        # The handle stays with the thread left, whatever its directory; the new thread is told, named and offered it.
+        _, holder, predecessor, _ = found[0]
+        return {**result, "suggest": False, "fresh": {"handle": holder, "from": f"codex:{predecessor}"}}
 
     def walk_back(self, bindings, thread, process, lines, previous):
         """One pane's predecessor resolved to its holder: `(holder, predecessor, via)`, walking back

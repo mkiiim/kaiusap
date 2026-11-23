@@ -303,6 +303,8 @@ class OpenCode2Adapter(TerminalProcesses):
     screen_events = frozenset({"tool.execute.before"})
     screened_tools = SCREENED_TOOLS
     setup_flags = frozenset({"opencode", "opencode_config", "opencode_command"})  # choosing the OpenCode provider
+    session_noun = "session"
+    shown_stays = False  # the service part can show the user nothing, so the session tells them
 
     @classmethod
     def claims(cls, environment):
@@ -772,12 +774,54 @@ class OpenCode2Adapter(TerminalProcesses):
         """A text the plugin adds to the turn's model requests in its `context` hook, not stored or shown."""
         return {"hookSpecificOutput": {"tell": text}}
 
+    def show(self, text, event="session.prompt"):
+        """The service part has no way to show the user a line: nothing."""
+        return {}
+
+    def resume_command(self, session_key, cwd):
+        import shlex
+        from ..model import last_directory, load_settings
+        session = session_key.split(":", 1)[1]
+        command = f"{load_settings(self.store)['opencode2_command']} --session {shlex.quote(session)}"
+        directory = last_directory(self.store, session_key)
+        if directory and cwd and os.path.normpath(directory) != os.path.normpath(cwd):
+            command = f"cd {shlex.quote(directory)} && {command}"
+        return command
+
+    def name_fresh(self, event, handle, name):
+        """Title a fresh start's new session with the PATCH, when its title is empty, the default, or the
+        handle's. One the service doesn't take is tried again at the session's next hook."""
+        session = event["session_id"]
+        if self.service.registration() is None:
+            self.fresh_named(event, handle, name, False)
+            return []
+        info = self.ask(self.service_for(session).session, session)
+        title = info.get("title") if isinstance(info, dict) else None
+        if not no_title(title) and title != handle:
+            return []
+        try:
+            self.service_for(session).set_title(session, name, limit=self.limit(LOOKUP_LIMIT))
+        except (ServiceError, TimeoutError) as exc:
+            self.store.log(f"OpenCode 2 title {name} for {event['session_key']} not set: {getattr(exc, 'code', 'timeout')}")
+            self.fresh_named(event, handle, name, False)
+            return []
+        self.fresh_named(event, handle, name, True)
+        return self.follow_session_name(session, name)
+
+    def fresh_named(self, event, handle, name, applied, retry=False):
+        try:
+            self.store.event("named", handle=handle, session_id=event["session_id"], session_key=event["session_key"],
+                             binding=None, name=name if applied else None, wanted=name, kind="fresh", retry=retry,
+                             by_session=event["session_id"], by_session_key=event["session_key"], deadline=event.get("deadline"))
+        except OSError as exc:
+            self.store.warn(exc)
+
     # ----- naming ---------------------------------------
 
     def hook_output(self, event, state):
         """The name is set from Python, at once: here only a name a call couldn't set, at the next start or
         prompt, while the service answers."""
-        from ..model import held
+        from ..model import fresh_pending, held
         if event.get("agent_id") or event.get("kind") not in {"startup", "resume", "clear", "fork", "prompt"}:
             return {}
         ended, bindings = state.data["ended"], state.data["bindings"]
@@ -795,6 +839,22 @@ class OpenCode2Adapter(TerminalProcesses):
         for binding, left_at in ended:
             if binding["session_key"] == key and binding["id"] not in done and not handle:
                 self.retire(binding, left_at, cause="hook")
+        pending = None if handle else fresh_pending(events, key)
+        if pending and event.get("kind") != "clear":
+            # A fresh session's title the service didn't take at its start, once more.
+            session = event["session_id"]
+            info = self.ask(self.service_for(session).session, session)
+            title = info.get("title") if isinstance(info, dict) else None
+            applied = False
+            if no_title(title) or title == pending["handle"]:
+                try:
+                    self.service_for(session).set_title(session, pending["wanted"], limit=self.limit(LOOKUP_LIMIT))
+                    applied = True
+                except (ServiceError, TimeoutError) as exc:
+                    self.store.log(f"OpenCode 2 title for {key} not set: {getattr(exc, 'code', 'timeout')}")
+            self.fresh_named(event, pending["handle"], pending["wanted"], applied, retry=True)
+            if applied:
+                self.follow_session_name(session, pending["wanted"])
         return {}
 
     def marker_fields(self, state, event):
@@ -1056,32 +1116,61 @@ class OpenCode2Adapter(TerminalProcesses):
         return proposal
 
     def step_fork(self, event, store):
+        """A copy whose original holds a handle: when the terminal that showed the original now shows the copy and
+        no other running terminal shows the original, the user is moved into it and the handle moves; otherwise
+        the copy is offered it."""
         from ..model import handles, held
         original = event.get("fork_of")
         handle = held(handles(store), f"{PROVIDER}:{original}") if original else None
-        if handle:
-            return {"text": f"This conversation is a copy of the one holding {handle}, which keeps it; you have no handle.",
+        if not handle:
+            return {"text": COPY, "suggest": False}
+        terminal = self.moved_into(event, original)
+        if terminal:
+            event["tui.route"] = terminal  # the currency check's terminal
+            return {"move": {"handle": handle, "from": f"{PROVIDER}:{original}", "to": event["session_key"],
+                             "reason": "copy", "via": None},
+                    "text": f"You are {handle}; the handle followed this conversation from session {original}, which it replaced in this terminal.",
+                    "failed": f"You may be {handle}: this conversation replaced its session in this terminal, but kaiusap couldn't follow it in time. Ask the user.",
                     "suggest": False}
-        return {"text": COPY, "suggest": False}
+        return {"suggest": False, "copy_of": {"handle": handle, "from": f"{PROVIDER}:{original}"}}
+
+    def moved_into(self, event, original):
+        """The terminal (pid, start time) whose report showed `original` just before it showed the copy, when no
+        other running terminal shows `original`; None otherwise. Waits for the copy's report as `new_session` does."""
+        copy = event["session_id"]
+        end = self.clock() + self.terminal_wait
+        if self._deadline is not None:
+            end = min(end, self._deadline - 1)
+        while True:
+            self._terminals = None
+            rows = self.terminal_rows()
+            mine = next((r for r in rows if r.get("shows") == copy), None)
+            if mine is not None or self.clock() >= end:
+                break
+            time.sleep(TERMINAL_POLL)
+        if mine is None:
+            return None
+        terminal = (mine.get("pid"), mine.get("process_started_at"))
+        history = [r for r in rows if (r.get("pid"), r.get("process_started_at")) == terminal]
+        before = next((r.get("shows") for r in history[history.index(mine) + 1:]
+                       if r.get("quit") or r.get("shows") != copy), None)
+        if before != original or self.showing(original, exclude=terminal):
+            return None
+        return terminal
 
     def step_clear(self, event, store):
-        """The move as for OpenCode 1.x: the predecessor A holds a handle and no other running terminal shows
-        it; A with no handle continues as a persona; another running terminal showing A: no move."""
+        """The session A this terminal showed before the new one: when A holds a handle, the new session is placed
+        as a fresh start's; otherwise nothing is said."""
         from ..model import handles, held
         predecessor, terminal = event.get("predecessor"), event.get("tui.route")
         if not predecessor or not terminal:
             return None
-        self._terminals = None
-        if self.showing(predecessor, exclude=terminal):
-            return None  # still live in another terminal: its mail goes there
+        # The handle stays with the session left; the new one is told, named and offered it. A session left
+        # that holds no handle: nothing is said.
         name = held(handles(store), f"{PROVIDER}:{predecessor}")
         if not name:
-            return {"persona": {"continues": f"{PROVIDER}:{predecessor}", "via": "fresh-start"}}
-        return {"move": {"handle": name, "from": f"{PROVIDER}:{predecessor}", "to": event["session_key"],
-                         "reason": "fresh-start", "via": None},
-                "text": f"You are {name}; the handle followed this conversation from session {predecessor}, which it replaced in this terminal.",
-                "failed": f"You may be {name}: this conversation replaced its session in this terminal, but kaiusap couldn't follow it in time. Ask the user.",
-                "suggest": False}
+            return {"suggest": False}
+        return {"suggest": False, "fresh": {"handle": name, "from": f"{PROVIDER}:{predecessor}"}}
 
     def step_upgrade(self, event, store):
         """Upgrading from 1.x (proposed, for the user): a copied session's first start in OpenCode 2 is told

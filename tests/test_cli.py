@@ -246,3 +246,26 @@ def test_no_text_renderer_prints_none_for_a_null_field():
     }
     for verb, result in results.items():
         assert "None" not in render(verb, result), verb
+
+
+def test_iam_confirmed_is_a_flag_with_no_value():
+    from kaiusap.cli import parse
+    from kaiusap.errors import Error
+    assert parse(["iam", "alpha", "--confirmed"], StringIO()) == ("iam", {"handle": "alpha", "confirmed": True})
+    with pytest.raises(Error, match="takes no value"):
+        parse(["iam", "alpha", "--confirmed=yes"], StringIO())
+    with pytest.raises(Error, match="Flags not allowed"):
+        parse(["whoami", "--confirmed"], StringIO())
+
+
+def test_a_refusal_with_a_reason_carries_it_in_json(monkeypatch):
+    from kaiusap import cli
+    from kaiusap.errors import Error
+
+    def refuse(argv, stdin):
+        raise Error("held; confirm first", 1, "confirmation_needed")
+
+    monkeypatch.setattr(cli, "parse", refuse)
+    out, err = StringIO(), StringIO()
+    code = main(["iam", "alpha", "--json"], stdout=out, stderr=err)
+    assert code == 1 and json.loads(out.getvalue())["reason_code"] == "confirmation_needed"

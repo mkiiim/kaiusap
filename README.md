@@ -80,7 +80,7 @@ Tell each session to name itself:
 
 > you are backend-eng
 
-The name is the session's handle. Think of it as its persona with which you can maintain long-lived conversations. It will stay with your session when you resume it and through native harness commands like `/clear`. This allows other sessions to use it as an identity to which they send messages and keep track of each other.
+The name is the session's handle. Think of it as its persona with which you can maintain long-lived conversations. It stays with your session when you resume it. After `/clear` or `/new`, it stays with the conversation you left: the new session is told so, shown how to go back, and offered the handle, so saying "you are backend-eng" there carries it on. This allows other sessions to use it as an identity to which they send messages and keep track of each other.
 
 You can also let kAIusap name your session. The first time a session with no handle calls kAIusap, for example to check its inbox or send a message, it offers you a randomly generated name such as `delicate-haze-4521`. To have it take a randomly generated name straight away, just tell it:
 

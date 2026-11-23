@@ -42,6 +42,8 @@ class Provider(Protocol):
     prompt_events: frozenset[str]  # of those, the prompt hook's, which adds the unread-mail note on every call
     screen_events: frozenset[str]  # of those, the tool-call screens decided by `pre_tool`, before any store work
     setup_flags: frozenset[str]  # the `kaiusap setup` flags its `setup_items` read from `setup.options`, as keys
+    session_noun: str  # its word for a session in what a session is told: "session", or "thread"
+    shown_stays: bool  # whether the line `show` gives the user stays on screen; if not, the session is asked to tell the user
 
     @classmethod
     def claims(cls, environment: dict) -> bool: ...
@@ -70,6 +72,9 @@ class Provider(Protocol):
     def deliver(self, store, message: dict, deadline: float | None = None) -> dict: ...
     def list(self) -> list[dict]: ...
     def tell(self, text: str, event: str = "UserPromptSubmit") -> dict: ...
+    def show(self, text: str, event: str = "UserPromptSubmit") -> dict: ...  # the hook output that shows the user a line directly, not through the assistant; {} when the provider has no way
+    def resume_command(self, session_key: str, cwd: str | None) -> str | None: ...  # the command that opens the session again, with a `cd` when its directory isn't `cwd`
+    def name_fresh(self, event: dict, handle: str, name: str) -> list[str]: ...  # name the new session of a fresh start made in `handle`'s session; returns warnings
     def mirror(self, binding: dict) -> list[str]: ...
     def retire(self, binding: dict, left_at: str, cause: str | None = None) -> list[str]: ...
     def refuse_before_acting(self, identity: Identity) -> None: ...
@@ -165,6 +170,8 @@ class UnavailableProvider:
     prompt_events = frozenset()
     screen_events = frozenset()
     setup_flags = frozenset()
+    session_noun = "session"
+    shown_stays = False
 
     @classmethod
     def claims(cls, environment):
@@ -244,6 +251,15 @@ class UnavailableProvider:
     def tell(self, text, event="UserPromptSubmit"):
         return {}
 
+    def show(self, text, event="UserPromptSubmit"):
+        return {}
+
+    def resume_command(self, session_key, cwd):
+        return None
+
+    def name_fresh(self, event, handle, name):
+        return []
+
     def mirror(self, binding):
         return ["Provider name mirroring is not implemented for this provider yet."]
 
@@ -293,7 +309,7 @@ def activity_reading(state, waiting_on=()):
     return {"state": state, "waiting_on": waits, "observed_at": at}
 
 
-BINDING_REASONS = {"iam", "fresh-start", "rewind", "moved-directory", "moved-background"}
+BINDING_REASONS = {"iam", "fresh-start", "rewind", "moved-directory", "moved-background", "copy"}
 
 # The registry: each provider's adapter, by the session key's prefix, as (module, class, display name).
 # The modules are imported only when an adapter is built, so the hook entry pays for none it doesn't use.

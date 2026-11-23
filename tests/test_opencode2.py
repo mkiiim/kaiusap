@@ -304,3 +304,93 @@ def test_the_resume_command_starts_with_the_opencode2_command_setting(store, tmp
         assert row["command"].endswith(f"{first} --session {shlex.quote(fixture.SESSION)}")
     finally:
         world.close()
+
+
+# ----- following: a fresh start leaves the handle; a copy the user is moved into takes it -----------------
+
+
+def following_world(store, tmp_path, label):
+    import importlib.util
+    from pathlib import Path
+    path = Path(__file__).parent / "contract" / "opencode2.py"
+    spec = importlib.util.spec_from_file_location(f"contract_fixture_opencode2_{label}", path)
+    fixture = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fixture)
+    return fixture, fixture.World(store, tmp_path)
+
+
+def hold(store, handle, session):
+    from kaiusap.store import identifier, now
+    at = now()
+    store.append("handles.jsonl", {"at": at, "id": identifier(at), "handle": handle, "reason": "iam", "session_id": session,
+                                   "session_key": f"opencode2:{session}", "provider": "opencode2", "moved_from": None,
+                                   "also_released": None})
+
+
+def report(world, fixture, shows):
+    world.adapter.events({**fixture.hook_input("tui.route", shows=shows), "hook_event_name": "tui.route"})
+
+
+def begin(world, fixture, **extra):
+    import time
+    from kaiusap.adapters import Providers
+    from kaiusap.following import follow
+    deadline = time.monotonic() + 5
+    payload = {**fixture.hook_input("session.start", **extra), "hook_event_name": "session.start"}
+    event = world.adapter.events(payload, deadline=deadline)
+    world.adapter.hook_record("session.start", event, deadline)
+    return event, follow(world.adapter.store, Providers({"opencode2": world.adapter}, world.adapter.store), event, deadline)
+
+
+def test_new_leaves_the_handle_and_tells_titles_and_offers_the_new_session(store, tmp_path):
+    from kaiusap.model import handles, open_offers
+    fixture, world = following_world(store, tmp_path, "fresh")
+    try:
+        world.service.serve(None)
+        hold(store, "alpha", fixture.OTHER)
+        for shows in (fixture.OTHER, None, fixture.SESSION):
+            report(world, fixture, shows)
+        event, result = begin(world, fixture)
+        assert event["kind"] == "clear"
+        [text] = [t for t in result["texts"] if t.startswith("This is a new conversation.")]
+        assert f"alpha stays with the conversation left in this terminal, session {fixture.OTHER}." in text
+        assert text.endswith("Tell the user this once, in your first reply.")
+        assert result["moved"] is False and handles(store)["alpha"]["session_key"] == f"opencode2:{fixture.OTHER}"
+        assert [o["offered"] for o in open_offers(store, session_key=f"opencode2:{fixture.SESSION}")] == ["alpha"]
+        assert world.service.title.startswith("alpha~")
+        assert world.adapter.show("line") == {}
+    finally:
+        world.close()
+
+
+def test_a_fork_the_terminal_switches_to_takes_the_handle(store, tmp_path):
+    from kaiusap.model import handles
+    fixture, world = following_world(store, tmp_path, "fork_moved")
+    try:
+        world.service.serve(None)
+        hold(store, "alpha", fixture.OTHER)
+        report(world, fixture, fixture.OTHER)
+        report(world, fixture, fixture.SESSION)
+        event, result = begin(world, fixture, fork_of=fixture.OTHER)
+        assert event["kind"] == "fork" and result["moved"] is True
+        line = handles(store)["alpha"]
+        assert (line["session_key"], line["reason"]) == (f"opencode2:{fixture.SESSION}", "copy")
+        assert world.service.title == "alpha"
+    finally:
+        world.close()
+
+
+def test_a_fork_no_terminal_switched_to_is_offered_the_handle(store, tmp_path):
+    from kaiusap.model import handles, open_offers
+    fixture, world = following_world(store, tmp_path, "fork_offered")
+    try:
+        world.service.serve(None)
+        hold(store, "alpha", fixture.OTHER)
+        report(world, fixture, fixture.OTHER)  # the terminal still shows the original
+        event, result = begin(world, fixture, fork_of=fixture.OTHER)
+        assert result["moved"] is False and handles(store)["alpha"]["session_key"] == f"opencode2:{fixture.OTHER}"
+        assert ("This conversation is a copy of alpha's. It has no handle. To carry on as alpha here, the user says "
+                "'you are alpha'. Tell the user this once, in your first reply.") in result["texts"]
+        assert [o["offered"] for o in open_offers(store, session_key=f"opencode2:{fixture.SESSION}")] == ["alpha"]
+    finally:
+        world.close()

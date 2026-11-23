@@ -45,7 +45,7 @@ def rule_lines(numbers=None):
 
 VERBS = {
     "whoami": "Show your handle, reachability and unread count.", "who": "List active handles.",
-    "iam": "Take a handle on the user's word; refused while a running session holds it. With no handle, take a generated one.", "release": "Release your handle on the user's word.",
+    "iam": "Take a handle on the user's word; refused while a running session holds it. With no handle, take a generated one. --confirmed takes an offered handle from a running session, once the user confirms.", "release": "Release your handle on the user's word.",
     "send": "Send a new message using --to, --subject, --reply-needed yes|no and body fields.",
     "reply": "Answer a message id using --body and --reply-needed yes|no.",
     "inbox": "List your mail; --all includes resolved mail, --sent lists sent mail.",
@@ -155,7 +155,7 @@ class Core:
         from . import build
         return dict(build.running())
 
-    def iam(self, handle=None):
+    def iam(self, handle=None, confirmed=False):
         generated = handle is None
         if not generated and (not isinstance(handle, str) or not re.fullmatch(r"[a-z][a-z0-9-]{1,31}", handle)):
             raise Error(f"{handle or ''} isn't a valid handle. Use 2–32 lowercase letters, digits and hyphens, starting with a letter.")
@@ -183,9 +183,14 @@ class Core:
                 # A handle is a persona's name. Another persona's is taken only when it isn't live, or
                 # when this session was offered it, which continues that persona here.
                 offer = self.open_offer(handle, previous)
-                if not offer and self.holder_live(previous):
+                if (not offer or not confirmed) and self.holder_live(previous):
                     location = self.provider.where(previous["session_key"])
                     directory = location.get("cwd") or last_directory(self.store, previous["session_key"]) or "an unknown directory"
+                    if offer:
+                        # Offered, but its session is running: the user confirms once; nothing is written meanwhile.
+                        raise Error(f"{handle} is held by a running {display_name(previous['provider'])} session in {directory}. "
+                                    f"Ask the user to confirm that {handle} should move here, with its mail and its earlier "
+                                    "handles; if they do, run iam again with --confirmed.", 1, "confirmation_needed")
                     raise Error(f"{handle} is in use by a running {display_name(previous['provider'])} session in {directory}. "
                                 "Tell that session to take another name (its messages go with it), or choose another name.")
                 location = self.provider.where(previous["session_key"])

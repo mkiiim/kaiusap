@@ -30,7 +30,8 @@ SUMMARIES = {
     "iam": ("Take a handle for this session, on the user's word ('you are <handle>'). A handle a running session holds is refused; "
             "one from a stopped session moves here, and its earlier mail stays with that session unless kaiusap offered you "
             "the handle. The result says which. With no handle, kaiusap picks a free generated name and takes it, "
-            "for when the user asks you to pick a name."),
+            "for when the user asks you to pick a name. An offered handle whose session is still running needs the "
+            "user's confirmation: ask them, and only on their word call again with confirmed true."),
     "release": "Release this session's handle, on the user's word.",
     "send": ("Send a new message to a handle. reply_needed says whether you expect an answer. Body fields: with reply_needed true, "
              "request and expected_output are required; with false, context is. context, current_state, constraints and "
@@ -71,7 +72,7 @@ SCHEMAS = {
                              **{name: STRING for name in sorted(FIELDS - {"body", "request"})}},
               "required": ["id", "body", "reply_needed"],
               "allOf": [when(True, ["expected_output"])]},
-    "iam": {"properties": {"handle": STRING}, "required": []},
+    "iam": {"properties": {"handle": STRING, "confirmed": BOOLEAN}, "required": []},
     "read": {"properties": {"id": STRING}, "required": ["id"]},
     "moot": {"properties": {"id": STRING, "reason": STRING}, "required": ["id"]},
     "inbox": {"properties": {"all": BOOLEAN, "sent": BOOLEAN}},
@@ -207,6 +208,8 @@ def call(provider, tool, given, meta):
             providers.finish(catch_up=False)  # a lookup that ended the call early leaves no connection open
     text = "kaiusap: " + str(error).replace("\n", " ").replace("\r", " ")
     structured = {"schema": 1, "error": text, "code": error.code}
+    if getattr(error, "reason_code", None):
+        structured["reason_code"] = error.reason_code
     suggested = getattr(error, "suggested_handle", None)
     if suggested:
         text += "\n" + SUGGESTION.format(suggested)

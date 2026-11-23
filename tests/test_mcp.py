@@ -747,3 +747,8 @@ def test_calls_run_concurrently_one_held_open_by_a_slow_listing(rig, store):
             r = shape(await held, "whoami")
             assert r["session_key"] == "claude:old" and r["cwd"] == "/live"
     run(scenario())
+
+
+def test_iam_takes_confirmed_as_a_boolean():
+    assert arguments("iam", {"handle": "alpha", "confirmed": True}) == ("iam", {"handle": "alpha", "confirmed": True})
+    assert arguments("iam", {"handle": "alpha", "confirmed": "true"})[1]["confirmed"] is True
