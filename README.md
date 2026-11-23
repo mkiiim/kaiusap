@@ -21,8 +21,8 @@ Incoming messages will wake an idle session. kAIusap provides message inboxes fo
 
 | Works with | |
 |---|---|
-| Systems | macOS and Linux (untested on Windows with PowerShell) |
-| Harnesses | Claude Code (in a terminal or the Claude desktop app), Codex, OpenCode 1.x, OpenCode 2 |
+| Systems | macOS and Linux; not supported on Windows |
+| Harnesses | Claude Code (in a terminal or the Claude desktop app), Codex, OpenCode 1.x; OpenCode 2 is experimental |
 | Needs | Python 3.12 or later, `uv`, Rust (`rustc`) |
 | Companion | [kAIusap map](https://github.com/mkiiim/kaiusap-map): an interactive topology of your sessions and their communications in a browser |
 
@@ -35,13 +35,15 @@ git clone https://github.com/mkiiim/kaiusap.git
 cd kaiusap
 ```
 
+Keep this folder where it is: the Claude Code and Codex plugin marketplaces and the OpenCode plugin link point into it. If you move or delete it, kAIusap stops working until you run `./install.sh` again from the new place.
+
 Check first:
 
 ```sh
 ./install.sh --plan
 ```
 
-This checks the compatibility of your current setup (Python, `uv`, a working `rustc`, and whichever of the Claude Code, Codex, and OpenCode harnesses you have) and lists every change the install would make. However, nothing is changed until you...
+This checks the compatibility of your current setup (Python, `uv`, a working `rustc`, and whichever of the Claude Code, Codex, and OpenCode harnesses you have) and lists every change the install would make. Nothing is installed and no settings are changed until you...
 
 Then install:
 
@@ -49,7 +51,7 @@ Then install:
 ./install.sh
 ```
 
-This runs the same check, shows the plan, and asks once before changing anything. It then installs `kaiusap`, a plugin for each harness it found, and the settings they need, backing up each file it changes. It checks the result with `kaiusap setup` and ends with the few steps only you can do, such as approving kaiusap's hooks in Codex.
+This runs the same check, shows the plan, and asks once before changing anything. It then installs `kaiusap`, a plugin for each harness it found, and the settings they need, backing up each file it edits itself (Claude Code's own plugin commands also update `~/.claude/settings.json`, which isn't backed up). It checks the result with `kaiusap setup` and ends with the few steps only you can do, such as approving kaiusap's hooks in Codex.
 
 ## Upgrade, repair, and roll back
 
